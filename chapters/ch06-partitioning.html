@@ -1,0 +1,498 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>DDIA Visual Guide — Chapter 6: Partitioning</title>
+  <link rel="stylesheet" href="../assets/styles.css">
+</head>
+<body>
+
+<header class="cover">
+  <div class="series">Designing Data-Intensive Applications · Visual Companion</div>
+  <h1>Chapter 6<br>Partitioning</h1>
+  <p class="subtitle">Splitting data across machines — and keeping load fair when one key owns the world</p>
+  <div class="badge">Source: claude-skills / ch06-partitioning.md · Illustrated · Interview-ready</div>
+  <p class="meta" style="margin-top:2rem;">Martin Kleppmann · Part II: Distributed Data</p>
+</header>
+
+<nav class="toc">
+  <h2>Table of Contents</h2>
+  <ol>
+    <li><a href="#core">Core Idea</a></li>
+    <li><a href="#key-range">Framework: Partitioning by Key Range</a></li>
+    <li><a href="#hash">Framework: Partitioning by Hash of Key</a></li>
+    <li><a href="#skew">Skew, Hot Spots &amp; Key Salting</a></li>
+    <li><a href="#compound-key">Compound Primary Key</a></li>
+    <li><a href="#secondary-indexes">Secondary Indexes: Local vs Global</a></li>
+    <li><a href="#rebalancing">Rebalancing Strategies</a></li>
+    <li><a href="#routing">Request Routing &amp; Coordination</a></li>
+    <li><a href="#mental-models">Mental Models</a></li>
+    <li><a href="#anti-patterns">Anti-Patterns</a></li>
+    <li><a href="#worked-example">Worked Example: Sensor Network</a></li>
+    <li><a href="#problems-solved">Problems Each Mechanism Solves</a></li>
+    <li><a href="#connects">Connects To (Cross-Chapter)</a></li>
+    <li><a href="#takeaways">Key Takeaways</a></li>
+    <li><a href="#checkpoints">Junior SWE Checkpoints</a></li>
+  </ol>
+</nav>
+
+<!-- ═══ 1. CORE IDEA ═══ -->
+<section id="core">
+  <h2>1. Core Idea</h2>
+  <p>Replication (Ch 5) <strong>copies</strong> data; partitioning <strong>splits</strong> it. When a dataset or query load is too big for one machine, break it into <strong>partitions</strong> (a.k.a. shards in MongoDB/Elasticsearch, regions in HBase, tablets in BigTable, vnodes in Cassandra/Riak) so each record belongs to exactly one partition, and spread partitions across nodes in a shared-nothing cluster.</p>
+
+  <div class="card-grid">
+    <div class="card"><h4>📊 Scale data volume</h4><p>No single disk holds the whole dataset.</p></div>
+    <div class="card"><h4>⚡ Scale query throughput</h4><p>Parallelize reads/writes across nodes.</p></div>
+    <div class="card"><h4>⚖️ Fair load</h4><p>Each node does roughly equal work — when partitioning works.</p></div>
+  </div>
+
+  <div class="callout key">
+    <strong>The whole game is spreading data and load evenly.</strong> Unfair partitioning is called <strong>skew</strong>; a partition with disproportionately high load is a <strong>hot spot</strong> — in the worst case one node does all the work while nine sit idle.
+  </div>
+
+  <div class="callout realworld">
+    <strong>Partitioning + replication:</strong> usually combined — each node leads some partitions, follows others. But the two choices are <em>mostly independent</em>. Interview move: "Each shard has its own leader + followers" (Ch 5).
+  </div>
+</section>
+
+<!-- ═══ 2. KEY RANGE ═══ -->
+<section id="key-range">
+  <h2>2. Framework: Partitioning by Key Range</h2>
+  <p><em>Also:</em> range sharding, encyclopedia volumes. <strong>BigTable, HBase, RethinkDB, early MongoDB.</strong></p>
+
+  <table>
+    <tr><th>When</th><td>You need efficient range scans (time-series reads, prefix lookups) and can tolerate hot-spot risk.</td></tr>
+    <tr><th>How</th><td>Assign each partition a contiguous range of sorted keys. Boundaries adapt to data density, chosen manually or automatically. Keys stay sorted within a partition (SSTable-style), so range queries hit one or few partitions.</td></tr>
+    <tr><th>Why it works</th><td>Sort order is preserved — the key doubles as a concatenated index.</td></tr>
+    <tr><th>Failure mode</th><td>Access pattern concentrates on one end of the range: a timestamp key means all of today's writes land on today's partition while the rest idle.</td></tr>
+  </table>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 620 260" xmlns="http://www.w3.org/2000/svg" font-family="Inter, sans-serif">
+      <text x="310" y="22" text-anchor="middle" font-weight="700" font-size="13">Key-range partitioning — sorted volumes on a shelf</text>
+      <rect x="40" y="45" width="120" height="55" rx="6" fill="#dbeafe" stroke="#2563eb"/>
+      <text x="100" y="68" text-anchor="middle" font-size="10" font-weight="600">Partition A</text>
+      <text x="100" y="85" text-anchor="middle" font-size="9" fill="#64748b">A–F</text>
+      <rect x="175" y="45" width="120" height="55" rx="6" fill="#dbeafe" stroke="#2563eb"/>
+      <text x="235" y="68" text-anchor="middle" font-size="10" font-weight="600">Partition B</text>
+      <text x="235" y="85" text-anchor="middle" font-size="9" fill="#64748b">G–M</text>
+      <rect x="310" y="45" width="120" height="55" rx="6" fill="#dbeafe" stroke="#2563eb"/>
+      <text x="370" y="68" text-anchor="middle" font-size="10" font-weight="600">Partition C</text>
+      <text x="370" y="85" text-anchor="middle" font-size="9" fill="#64748b">N–S</text>
+      <rect x="445" y="45" width="120" height="55" rx="6" fill="#fee2e2" stroke="#dc2626"/>
+      <text x="505" y="68" text-anchor="middle" font-size="10" font-weight="600">Partition D</text>
+      <text x="505" y="85" text-anchor="middle" font-size="9" fill="#991b1b">T–Z (today)</text>
+      <rect x="40" y="130" width="80" height="40" rx="5" fill="#64748b"/><text x="80" y="155" text-anchor="middle" fill="white" font-size="10">Node 1</text>
+      <rect x="175" y="130" width="80" height="40" rx="5" fill="#64748b"/><text x="215" y="155" text-anchor="middle" fill="white" font-size="10">Node 2</text>
+      <rect x="310" y="130" width="80" height="40" rx="5" fill="#64748b"/><text x="350" y="155" text-anchor="middle" fill="white" font-size="10">Node 3</text>
+      <rect x="445" y="130" width="80" height="40" rx="5" fill="#dc2626"/><text x="485" y="155" text-anchor="middle" fill="white" font-size="10">Node 4</text>
+      <line x1="100" y1="100" x2="80" y2="128" stroke="#2563eb" stroke-width="2"/>
+      <line x1="235" y1="100" x2="215" y2="128" stroke="#2563eb" stroke-width="2"/>
+      <line x1="370" y1="100" x2="350" y2="128" stroke="#2563eb" stroke-width="2"/>
+      <line x1="505" y1="100" x2="485" y2="128" stroke="#dc2626" stroke-width="2"/>
+      <text x="310" y="200" text-anchor="middle" font-size="11" fill="#2563eb" font-weight="600">Range query "M–P" → 1 partition</text>
+      <text x="310" y="220" text-anchor="middle" font-size="11" fill="#dc2626" font-weight="600">Monotonic timestamp writes → all land on Partition D (hot spot)</text>
+      <rect x="15" y="235" width="590" height="22" rx="4" fill="#fef3c7" stroke="#d97706"/>
+      <text x="310" y="250" text-anchor="middle" font-size="9" fill="#92400e">WRITE traffic ████████░░░░░░░░░░░░ → skewed to newest range</text>
+    </svg>
+    <figcaption>Figure 2.1 — Key-range: cheap prefix/range scans, but monotonic keys create write hot spots.</figcaption>
+  </figure>
+
+  <div class="callout analogy">
+    <strong>📚 Encyclopedia shelf:</strong> volumes sorted A–Z — easy to find a chapter by letter. But if everyone only reads the newest volume, that shelf sags while the rest collect dust.
+  </div>
+</section>
+
+<!-- ═══ 3. HASH ═══ -->
+<section id="hash">
+  <h2>3. Framework: Partitioning by Hash of Key</h2>
+  <p><em>Default for write-heavy key-value workloads.</em> MongoDB (hash mode), Riak, Couchbase, Voldemort, Cassandra.</p>
+
+  <table>
+    <tr><th>When</th><td>Even distribution matters more than range queries.</td></tr>
+    <tr><th>How</th><td>Hash each key (MD5/FNV — doesn't need to be cryptographic), assign each partition a range of <em>hashes</em>. Similar keys get scattered uniformly.</td></tr>
+    <tr><th>Why it works</th><td>A good hash turns skewed inputs into a uniform distribution.</td></tr>
+    <tr><th>Failure mode</th><td>(a) Range queries — adjacent keys scattered, MongoDB hash mode sends range queries to <em>all</em> partitions; Riak/Couchbase/Voldemort don't support them on primary key. (b) Single hot key — identical keys → identical hashes → one partition hammered.</td></tr>
+  </table>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 620 220" xmlns="http://www.w3.org/2000/svg" font-family="Inter, sans-serif">
+      <text x="310" y="22" text-anchor="middle" font-weight="700" font-size="13">Hash partitioning — scatter keys, even load</text>
+      <rect x="30" y="45" width="90" height="35" rx="5" fill="#fef3c7" stroke="#d97706"/><text x="75" y="67" text-anchor="middle" font-size="10">user:42</text>
+      <rect x="130" y="45" width="90" height="35" rx="5" fill="#fef3c7" stroke="#d97706"/><text x="175" y="67" text-anchor="middle" font-size="10">user:43</text>
+      <rect x="230" y="45" width="90" height="35" rx="5" fill="#fef3c7" stroke="#d97706"/><text x="275" y="67" text-anchor="middle" font-size="10">user:44</text>
+      <text x="360" y="67" font-size="14" fill="#64748b">→ hash() →</text>
+      <circle cx="420" cy="62" r="18" fill="#7c3aed"/><text x="420" y="67" text-anchor="middle" fill="white" font-size="9">P2</text>
+      <circle cx="480" cy="62" r="18" fill="#059669"/><text x="480" y="67" text-anchor="middle" fill="white" font-size="9">P0</text>
+      <circle cx="540" cy="62" r="18" fill="#2563eb"/><text x="540" y="67" text-anchor="middle" fill="white" font-size="9">P1</text>
+      <rect x="30" y="110" width="170" height="45" rx="6" fill="#2563eb" opacity="0.85"/><text x="115" y="138" text-anchor="middle" fill="white" font-size="11">Partition 0 (hash 0–33%)</text>
+      <rect x="220" y="110" width="170" height="45" rx="6" fill="#059669" opacity="0.85"/><text x="305" y="138" text-anchor="middle" fill="white" font-size="11">Partition 1 (hash 33–66%)</text>
+      <rect x="410" y="110" width="170" height="45" rx="6" fill="#7c3aed" opacity="0.85"/><text x="495" y="138" text-anchor="middle" fill="white" font-size="11">Partition 2 (hash 66–100%)</text>
+      <text x="310" y="185" text-anchor="middle" font-size="11" fill="#059669" font-weight="600">Writes spread evenly across partitions</text>
+      <text x="310" y="205" text-anchor="middle" font-size="11" fill="#dc2626" font-weight="600">Range query "user:40–user:50" → must query ALL partitions (scatter/gather)</text>
+    </svg>
+    <figcaption>Figure 3.1 — Hash scatters adjacent keys; even write load, no cheap range scans on primary key.</figcaption>
+  </figure>
+
+  <div class="callout warning">
+    <strong>Consistent hashing caveat:</strong> Karger et al.'s consistent hashing (pseudo-random boundaries, built for CDN caches) rebalances poorly for databases — Cassandra abandoned it pre-1.2. "Consistent" here has <em>nothing</em> to do with replica or ACID consistency. Kleppmann's advice: avoid the term; say <strong>hash partitioning</strong>.
+  </div>
+</section>
+
+<!-- ═══ 4. SKEW / HOT SPOTS ═══ -->
+<section id="skew">
+  <h2>4. Skew, Hot Spots &amp; Key Salting</h2>
+  <p><strong>Skew</strong> = uneven load defeats partitioning. Hashing reduces but can't eliminate it — for a single hot key the application must intervene.</p>
+
+  <table>
+    <tr><th>Problem</th><th>Example</th><th>Why hashing fails</th></tr>
+    <tr><td>Monotonic keys + range partitioning</td><td>Timestamp as sole key</td><td>All writes hit newest partition</td></tr>
+    <tr><td>Single celebrity / viral key</td><td>One user ID gets all traffic</td><td>hash(same key) = same partition every time</td></tr>
+  </table>
+
+  <h3>Application-level fix: key salting</h3>
+  <p>Append a 2-digit random suffix to spread writes over 100 keys (e.g. <code>celebrity_id#42</code>). <strong>Cost:</strong> reads must gather all 100 variants; you must track which keys are split.</p>
+
+  <div class="callout pitfall">
+    <strong>🚨 Hot key on hash partition:</strong> A celebrity's ID still hammers one partition. No partition scheme fixes a single logical key — only the application can split it (salting) or cache aggressively at the edge.
+  </div>
+</section>
+
+<!-- ═══ 5. COMPOUND KEY ═══ -->
+<section id="compound-key">
+  <h2>5. Compound Primary Key</h2>
+  <p>Cassandra-style: hash only the <strong>first column</strong> to pick the partition; remaining columns are a concatenated sort index within it.</p>
+
+  <pre>(user_id, update_timestamp)
+  ↑ hash this → pick partition
+              ↑ sort within partition → cheap per-user time-range scans</pre>
+
+  <div class="card-grid">
+    <div class="card"><h4>Even distribution</h4><p>Hash <code>user_id</code> → writes spread across users.</p></div>
+    <div class="card"><h4>Efficient range scans</h4><p>Within one partition, rows sorted by <code>timestamp</code>.</p></div>
+    <div class="card"><h4>Scoped trade-off</h4><p>Multi-user time-range query = N targeted scans (one per user), not one global scan.</p></div>
+  </div>
+
+  <div class="callout key">
+    <strong>Interview move:</strong> split "which partition" from "sort within partition." Hash the first component, sort by the rest. Used in chat systems <code>(channel_id, message_id)</code>, email <code>(user_id, …)</code>.
+  </div>
+</section>
+
+<!-- ═══ 6. SECONDARY INDEXES ═══ -->
+<section id="secondary-indexes">
+  <h2>6. Secondary Indexes: Local vs Global</h2>
+  <p>Primary key picks the partition. Secondary indexes let you query by non-primary fields — but partitioning forces a painful trade.</p>
+
+  <table>
+    <tr><th>Type</th><th>Also called</th><th>Writes</th><th>Reads</th><th>Systems</th></tr>
+    <tr>
+      <td><strong>Document-partitioned</strong></td>
+      <td>Local secondary index</td>
+      <td>Fast — touch one partition only</td>
+      <td><strong>Scatter/gather</strong> across all partitions — tail latency amplification</td>
+      <td>MongoDB, Riak, Cassandra, Elasticsearch, SolrCloud, VoltDB</td>
+    </tr>
+    <tr>
+      <td><strong>Term-partitioned</strong></td>
+      <td>Global secondary index</td>
+      <td>Single doc update may touch many index partitions → typically <strong>async</strong> (DynamoDB GSIs)</td>
+      <td>Fast — read hits one partition</td>
+      <td>DynamoDB GSIs</td>
+    </tr>
+  </table>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 620 240" xmlns="http://www.w3.org/2000/svg" font-family="Inter, sans-serif">
+      <text x="310" y="20" text-anchor="middle" font-weight="700" font-size="13">Local index: scatter/gather read</text>
+      <rect x="30" y="40" width="130" height="50" rx="6" fill="#64748b"/><text x="95" y="62" text-anchor="middle" fill="white" font-size="10" font-weight="600">Partition 1</text><text x="95" y="78" text-anchor="middle" fill="#cbd5e1" font-size="8">local idx: color=red</text>
+      <rect x="180" y="40" width="130" height="50" rx="6" fill="#64748b"/><text x="245" y="62" text-anchor="middle" fill="white" font-size="10" font-weight="600">Partition 2</text><text x="245" y="78" text-anchor="middle" fill="#cbd5e1" font-size="8">local idx: color=red</text>
+      <rect x="330" y="40" width="130" height="50" rx="6" fill="#64748b"/><text x="395" y="62" text-anchor="middle" fill="white" font-size="10" font-weight="600">Partition 3</text><text x="395" y="78" text-anchor="middle" fill="#cbd5e1" font-size="8">local idx: (empty)</text>
+      <rect x="480" y="40" width="110" height="50" rx="6" fill="#64748b"/><text x="535" y="62" text-anchor="middle" fill="white" font-size="10" font-weight="600">Partition 4</text><text x="535" y="78" text-anchor="middle" fill="#cbd5e1" font-size="8">local idx: color=red</text>
+      <rect x="250" y="115" width="120" height="35" rx="5" fill="#2563eb"/><text x="310" y="137" text-anchor="middle" fill="white" font-size="10" font-weight="600">Client query</text>
+      <text x="310" y="108" text-anchor="middle" font-size="9" fill="#2563eb">WHERE color = 'red'</text>
+      <line x1="310" y1="150" x2="95" y2="92" stroke="#2563eb" stroke-width="1.5" stroke-dasharray="4,3"/>
+      <line x1="310" y1="150" x2="245" y2="92" stroke="#2563eb" stroke-width="1.5" stroke-dasharray="4,3"/>
+      <line x1="310" y1="150" x2="395" y2="92" stroke="#2563eb" stroke-width="1.5" stroke-dasharray="4,3"/>
+      <line x1="310" y1="150" x2="535" y2="92" stroke="#2563eb" stroke-width="1.5" stroke-dasharray="4,3"/>
+      <text x="310" y="175" text-anchor="middle" font-size="10" fill="#64748b">scatter to ALL partitions → gather results → merge</text>
+      <line x1="310" y1="185" x2="310" y2="200" stroke="#7c3aed" stroke-width="2"/>
+      <rect x="180" y="200" width="260" height="35" rx="6" fill="#ede9fe" stroke="#7c3aed"/>
+      <text x="310" y="222" text-anchor="middle" font-size="10" fill="#5b21b6">Global index: index partitioned BY the term → read hits 1 partition, write fans out</text>
+    </svg>
+    <figcaption>Figure 6.1 — Local index: write-cheap, read-expensive (scatter/gather). Global index: the opposite.</figcaption>
+  </figure>
+
+  <div class="callout analogy">
+    <strong>Pick your pain:</strong> write-cheap / read-expensive (local index) <em>or</em> read-cheap / write-expensive (global index). Secondary indexes force this trade — there is no free option. Synchronous global index updates need distributed transactions (Ch 7 &amp; 9) — which is why DynamoDB GSIs are async.
+  </div>
+</section>
+
+<!-- ═══ 7. REBALANCING ═══ -->
+<section id="rebalancing">
+  <h2>7. Rebalancing Strategies</h2>
+  <p>Moving data between nodes as load or cluster size changes. Requirements: fair load after, keep serving reads/writes during, move no more data than necessary.</p>
+
+  <div class="callout pitfall">
+    <strong>🚨 hash mod N (anti-pattern):</strong> <code>hash(key) mod N</code> reassigns most keys whenever N changes — rebalancing becomes catastrophically expensive. <strong>Never use this.</strong>
+  </div>
+
+  <table>
+    <tr><th>Strategy</th><th>How</th><th>Best for</th><th>Caveat</th></tr>
+    <tr>
+      <td><strong>Fixed number of partitions</strong></td>
+      <td>Create far more partitions than nodes (e.g. 1,000 for 10 nodes); new nodes steal whole partitions. Key→partition mapping never changes, only partition→node.</td>
+      <td>Hash partitioning</td>
+      <td>Riak, Cassandra ≥1.2, Elasticsearch, Couchbase</td>
+    </tr>
+    <tr>
+      <td><strong>Dynamic partitioning</strong></td>
+      <td>Split when partition exceeds size threshold (HBase default 10 GB), merge when it shrinks — B-tree-like. Count adapts to data volume.</td>
+      <td>Key-range partitioning</td>
+      <td>Empty DB starts with one partition (one busy node) — mitigate with <strong>pre-splitting</strong></td>
+    </tr>
+  </table>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 620 200" xmlns="http://www.w3.org/2000/svg" font-family="Inter, sans-serif">
+      <text x="310" y="20" text-anchor="middle" font-weight="700" font-size="13">Fixed partitions: move mapping, not key→partition</text>
+      <text x="155" y="45" text-anchor="middle" font-weight="600" font-size="11" fill="#64748b">Before (3 nodes, 9 partitions)</text>
+      <rect x="30" y="55" width="250" height="55" rx="6" fill="#dbeafe" stroke="#2563eb"/>
+      <rect x="35" y="60" width="75" height="20" rx="3" fill="#2563eb"/><text x="72" y="74" text-anchor="middle" fill="white" font-size="8">P0 P1 P2</text>
+      <rect x="35" y="85" width="75" height="20" rx="3" fill="#059669"/><text x="72" y="99" text-anchor="middle" fill="white" font-size="8">P3 P4 P5</text>
+      <rect x="120" y="60" width="75" height="45" rx="3" fill="#7c3aed"/><text x="157" y="87" text-anchor="middle" fill="white" font-size="8">P6 P7 P8</text>
+      <text x="465" y="45" text-anchor="middle" font-weight="600" font-size="11" fill="#64748b">After (+1 node, steal partitions)</text>
+      <rect x="310" y="55" width="280" height="55" rx="6" fill="#d1fae5" stroke="#059669"/>
+      <rect x="315" y="60" width="60" height="20" rx="3" fill="#2563eb"/><text x="345" y="74" text-anchor="middle" fill="white" font-size="8">P0 P1</text>
+      <rect x="315" y="85" width="60" height="20" rx="3" fill="#059669"/><text x="345" y="99" text-anchor="middle" fill="white" font-size="8">P2 P3</text>
+      <rect x="385" y="60" width="60" height="45" rx="3" fill="#7c3aed"/><text x="415" y="87" text-anchor="middle" fill="white" font-size="8">P4–P6</text>
+      <rect x="455" y="60" width="60" height="45" rx="3" fill="#d97706"/><text x="485" y="87" text-anchor="middle" fill="white" font-size="8">P7 P8</text>
+      <text x="310" y="140" text-anchor="middle" font-size="11" fill="#059669" font-weight="600">Key → partition mapping unchanged. Only partition → node moves.</text>
+      <rect x="30" y="155" width="560" height="38" rx="6" fill="#fee2e2" stroke="#dc2626"/>
+      <text x="310" y="172" text-anchor="middle" font-size="10" fill="#991b1b" font-weight="600">hash(key) mod N → nearly ALL keys move when N changes ✗</text>
+      <text x="310" y="186" text-anchor="middle" font-size="10" fill="#991b1b">Fixed partitions / dynamic splits → move only what's necessary ✓</text>
+    </svg>
+    <figcaption>Figure 7.1 — Good rebalancing changes partition→node assignment; hash mod N entangles key mapping with node count.</figcaption>
+  </figure>
+
+  <div class="callout warning">
+    <strong>Fully automatic rebalancing + automatic failure detection:</strong> a slow node gets declared dead, rebalancing dumps its load on the rest, overloading them → <strong>cascading failure</strong>. Couchbase/Riak/Voldemort keep a human commit step for this reason.
+  </div>
+</section>
+
+<!-- ═══ 8. ROUTING ═══ -->
+<section id="routing">
+  <h2>8. Request Routing &amp; Coordination</h2>
+  <p><strong>Service discovery:</strong> how does a client find the right node for a key?</p>
+
+  <div class="decision-tree">
+    <div class="step"><span class="num">1</span><div><strong>Any-node routing</strong> — client hits any node, which forwards to the partition owner</div></div>
+    <div class="step"><span class="num">2</span><div><strong>Routing tier</strong> — partition-aware proxy (mongos, moxi) sits between clients and storage nodes</div></div>
+    <div class="step"><span class="num">3</span><div><strong>Partition-aware clients</strong> — client library knows the partition map directly</div></div>
+  </div>
+
+  <p>The hard part: keeping everyone's view of <strong>partition → node</strong> assignment in agreement.</p>
+
+  <table>
+    <tr><th>Coordination approach</th><th>Systems</th><th>Trade-off</th></tr>
+    <tr><td><strong>ZooKeeper</strong> (or Helix)</td><td>HBase, SolrCloud, Kafka; Espresso via Helix</td><td>External dependency; authoritative partition map</td></tr>
+    <tr><td><strong>Gossip</strong></td><td>Cassandra, Riak</td><td>No external dependency; more node-side complexity</td></tr>
+  </table>
+
+  <div class="callout realworld">
+    <strong>Node IPs change slowly enough</strong> that DNS suffices for the network layer. The partition map itself lives in coordination (ZooKeeper-like) or gossip — and everyone must agree (Ch 9 consensus territory for strong guarantees).
+  </div>
+</section>
+
+<!-- ═══ 9. MENTAL MODELS ═══ -->
+<section id="mental-models">
+  <h2>9. Mental Models</h2>
+
+  <div class="card-grid">
+    <div class="card">
+      <h4>1. Each partition is a small DB</h4>
+      <p>Independence is what makes scaling linear. Anything crossing partitions (global indexes, multi-key writes) is where the pain lives.</p>
+    </div>
+    <div class="card">
+      <h4>2. Encyclopedia shelf</h4>
+      <p>Key-range = sorted volumes — easy to find, but uneven unless boundaries follow the data.</p>
+    </div>
+    <div class="card">
+      <h4>3. Move the mapping, not the data</h4>
+      <p>Fixed partitions and dynamic splits change partition→node only. Hash mod N entangles both mappings — catastrophic on resize.</p>
+    </div>
+    <div class="card">
+      <h4>4. Pick your pain on indexes</h4>
+      <p>Local index: write-cheap, read-expensive. Global index: read-cheap, write-expensive (usually async). No free lunch.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ═══ 10. ANTI-PATTERNS ═══ -->
+<section id="anti-patterns">
+  <h2>10. Anti-Patterns</h2>
+  <table>
+    <tr><th>Anti-pattern</th><th>Why it fails</th></tr>
+    <tr><td><strong>hash mod N</strong> for node assignment</td><td>Nearly all keys move when cluster resizes — rebalancing catastrophe</td></tr>
+    <tr><td><strong>Monotonic keys under key-range partitioning</strong></td><td>Timestamps, auto-increment → all writes hit newest partition (hot spot)</td></tr>
+    <tr><td><strong>Trusting "consistent hashing" in DB docs</strong></td><td>Karger scheme doesn't rebalance well for databases; usually means hash partitioning with fixed partitions</td></tr>
+    <tr><td><strong>Fully automatic rebalancing + auto failure detection</strong></td><td>Slow node declared dead → load dumped on rest → cascading failure. Keep a human in the loop.</td></tr>
+    <tr><td><strong>DIY secondary indexes in application code</strong></td><td>Race conditions and partial write failures silently desync index and data</td></tr>
+  </table>
+</section>
+
+<!-- ═══ 11. WORKED EXAMPLE ═══ -->
+<section id="worked-example">
+  <h2>11. Worked Example: Sensor Network Compound Key</h2>
+  <p>Sensor network storing measurements. Key = measurement timestamp (<code>year-month-day-hour-minute-second</code>).</p>
+
+  <h3>Attempt 1: Key-range partitioning</h3>
+  <p>Keys sorted → "all readings for March" is one cheap range scan. But writes arrive in real time — every insert lands in <em>today's</em> partition. One node saturates on writes; the rest idle. Classic hot spot from a monotonically increasing key.</p>
+
+  <h3>Attempt 2: Hash partitioning</h3>
+  <p>Hash the timestamp → writes spread uniformly. But sort order is gone: "all readings from 17:08:10 to 17:09:00" must query <strong>every partition</strong> (scatter/gather).</p>
+
+  <h3>Attempt 3: Compound-key fix (Cassandra-style)</h3>
+  <pre>Primary key = (sensor_name, timestamp)
+              ↑ hash → partition     ↑ sort within partition</pre>
+  <p>With many concurrent sensors, write load spreads evenly. Per-sensor time-range queries are single-partition and efficient. Cost: multi-sensor time-range query = one range query per sensor name — you've traded a global scan for N targeted scans (fine when N is bounded).</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 620 280" xmlns="http://www.w3.org/2000/svg" font-family="Inter, sans-serif">
+      <text x="310" y="20" text-anchor="middle" font-weight="700" font-size="13">Compound key: hash partition col + sort within</text>
+      <rect x="30" y="35" width="180" height="100" rx="8" fill="#dbeafe" stroke="#2563eb"/>
+      <text x="120" y="55" text-anchor="middle" font-weight="600" font-size="10" fill="#2563eb">Partition (hash sensor_A)</text>
+      <text x="45" y="75" font-size="8" fill="#64748b">10:01:00 → 72°F</text>
+      <text x="45" y="90" font-size="8" fill="#64748b">10:02:00 → 73°F</text>
+      <text x="45" y="105" font-size="8" fill="#64748b">10:03:00 → 71°F</text>
+      <text x="120" y="125" text-anchor="middle" font-size="8" fill="#2563eb">sorted by timestamp ✓</text>
+      <rect x="220" y="35" width="180" height="100" rx="8" fill="#d1fae5" stroke="#059669"/>
+      <text x="310" y="55" text-anchor="middle" font-weight="600" font-size="10" fill="#059669">Partition (hash sensor_B)</text>
+      <text x="235" y="75" font-size="8" fill="#64748b">10:01:00 → 68°F</text>
+      <text x="235" y="90" font-size="8" fill="#64748b">10:02:00 → 69°F</text>
+      <text x="235" y="105" font-size="8" fill="#64748b">10:03:00 → 70°F</text>
+      <text x="310" y="125" text-anchor="middle" font-size="8" fill="#059669">sorted by timestamp ✓</text>
+      <rect x="410" y="35" width="180" height="100" rx="8" fill="#ede9fe" stroke="#7c3aed"/>
+      <text x="500" y="55" text-anchor="middle" font-weight="600" font-size="10" fill="#7c3aed">Partition (hash sensor_C)</text>
+      <text x="425" y="75" font-size="8" fill="#64748b">10:01:00 → 75°F</text>
+      <text x="425" y="90" font-size="8" fill="#64748b">10:02:00 → 74°F</text>
+      <text x="425" y="105" font-size="8" fill="#64748b">10:03:00 → 76°F</text>
+      <text x="500" y="125" text-anchor="middle" font-size="8" fill="#7c3aed">sorted by timestamp ✓</text>
+      <rect x="30" y="155" width="560" height="55" rx="6" fill="#fef3c7" stroke="#d97706"/>
+      <text x="310" y="175" text-anchor="middle" font-size="10" font-weight="600" fill="#92400e">Query: readings for sensor_A, 10:00–10:05</text>
+      <text x="310" y="195" text-anchor="middle" font-size="10" fill="#92400e">→ single partition, range scan on timestamp column</text>
+      <rect x="30" y="220" width="560" height="55" rx="6" fill="#fee2e2" stroke="#dc2626"/>
+      <text x="310" y="240" text-anchor="middle" font-size="10" font-weight="600" fill="#991b1b">Query: all sensors, 10:00–10:05</text>
+      <text x="310" y="260" text-anchor="middle" font-size="10" fill="#991b1b">→ N range queries (one per sensor) — not one global scan</text>
+    </svg>
+    <figcaption>Figure 11.1 — Compound key: even write spread + efficient per-entity range scans.</figcaption>
+  </figure>
+
+  <div class="callout key">
+    <strong>Interview move:</strong> identify the hot key structure, split "which partition" from "sort within partition." Don't accept the false binary of range-vs-hash — compound keys buy both, scoped.
+  </div>
+</section>
+
+<!-- ═══ 12. PROBLEMS SOLVED ═══ -->
+<section id="problems-solved">
+  <h2>12. Problems Each Mechanism Solves</h2>
+  <table>
+    <tr><th>Mechanism</th><th>Problem it solves</th><th>Example</th></tr>
+    <tr><td>Consistent-hash ring + virtual nodes</td><td>Rebalance without moving most keys when node count changes</td><td>Consistent-hashing service itself; leaderless KV store's replica placement</td></tr>
+    <tr><td>Hash sharding + read replicas</td><td>Point-lookup index too big for one node, read-heavy</td><td>URL shortener (<code>shortURL → longURL</code> map)</td></tr>
+    <tr><td>Per-host queue partitioning</td><td>Politeness + even crawl load without a shared lock</td><td>Web crawler's URL frontier (one worker owns a host)</td></tr>
+    <tr><td>Compound key: hash partition col + sort/cluster col</td><td>Even write spread <em>and</em> cheap per-entity range scans</td><td>Chat <code>(channel_id, message_id)</code>; email <code>user_id</code> partition + denormalized read/unread tables</td></tr>
+    <tr><td>Range partitioning + hot-range mitigation, shard-map manager</td><td>Prefix/range queries at scale without one range absorbing all load</td><td>Search autocomplete (trie shards <code>a-m</code>/<code>n-z</code>, further split on skew)</td></tr>
+    <tr><td>Space-filling curve (geohash / quadtree / S2)</td><td>Multi-dimensional (lat/lon) queries on a 1-D sorted-key system</td><td>Proximity service, Google Maps tile addressing</td></tr>
+    <tr><td>Topic partitions + consumer-group rebalancing</td><td>Parallelize an ordered log while keeping per-key order</td><td>Distributed message queue</td></tr>
+    <tr><td>Range-vs-hash partitioning by score, scatter/gather top-N</td><td>Global ranking query across shards without one shard owning it all</td><td>Real-time leaderboard</td></tr>
+    <tr><td>Consistent-hash placement groups + metadata sharded by <code>hash(bucket, object)</code></td><td>Spread object storage across nodes while keeping listing/pagination sane</td><td>S3-like object storage</td></tr>
+    <tr><td>Hash sharding by natural key (<code>hotel_id</code>)</td><td>Even load without breaking single-shard-per-entity invariant transactions rely on</td><td>Hotel reservation system</td></tr>
+    <tr><td>Collector placement on hash ring</td><td>Avoid two collectors scraping the same target</td><td>Metrics monitoring &amp; alerting</td></tr>
+  </table>
+</section>
+
+<!-- ═══ 13. CONNECTS TO ═══ -->
+<section id="connects">
+  <h2>13. Connects To (Cross-Chapter)</h2>
+  <table>
+    <tr><th>Chapter</th><th>Connection</th><th>Interview soundbite</th></tr>
+    <tr><td><strong>Ch 5 Replication</strong></td><td>Partitions are replicated; each node leads some, follows others. Orthogonal choices.</td><td>"Each shard has its own leader + followers."</td></tr>
+    <tr><td><strong>Ch 3 Storage</strong></td><td>Sorted keys within a partition = SSTables; dynamic splitting mirrors B-tree node splits; concatenated/multi-column indexes.</td><td>"Partition internals look like a mini LSM/B-tree."</td></tr>
+    <tr><td><strong>Ch 7 &amp; Ch 9 Transactions / Consensus</strong></td><td>Synchronous global index updates and agreeing on partition assignment both need distributed transactions/consensus — why global indexes go async and routing goes through ZooKeeper.</td><td>"Cross-partition = distributed transaction territory."</td></tr>
+    <tr><td><strong>Ch 10 Batch</strong></td><td>MPP warehouses parallelize joins/aggregations across partitions, far beyond single-key NoSQL access.</td><td>"Partitioning enables MPP query parallelism."</td></tr>
+  </table>
+</section>
+
+<!-- ═══ 14. TAKEAWAYS ═══ -->
+<section id="takeaways">
+  <h2>14. Key Takeaways</h2>
+  <ol>
+    <li><strong>Key-range gives cheap range scans but risks hot spots;</strong> hash gives even load but kills range queries. Compound keys buy both, scoped: hash the first component, sort by the rest.</li>
+    <li><strong>Hashing can't fix a single hot key</strong> — that's application-level (key salting), with read-side gather cost.</li>
+    <li><strong>Local secondary indexes:</strong> fast writes, scatter/gather reads. <strong>Global (term-partitioned):</strong> fast reads, multi-partition (usually async) writes.</li>
+    <li><strong>Rebalance by moving whole partitions:</strong> fixed-count for hash partitioning, dynamic split/merge for key ranges. <strong>Never hash mod N.</strong></li>
+    <li><strong>Routing is service discovery;</strong> the authoritative partition map lives in ZooKeeper-like coordination or gossip, and everyone must agree.</li>
+    <li><strong>Keep a human in the loop for rebalancing</strong> — automation plus failure detection can cascade.</li>
+  </ol>
+</section>
+
+<!-- ═══ 15. CHECKPOINTS ═══ -->
+<section id="checkpoints">
+  <h2>15. Junior SWE Checkpoints</h2>
+
+  <div class="quiz">
+    <h4>Q1: What's the difference between replication and partitioning?</h4>
+    <p>Replication <strong>copies</strong> the same data to multiple nodes (availability, read scaling). Partitioning <strong>splits</strong> data so each record lives on exactly one partition (data volume + write/query scaling). Usually combined: each node leads some partitions, follows others.</p>
+  </div>
+  <div class="quiz">
+    <h4>Q2: Why is timestamp-as-primary-key bad for key-range partitioning?</h4>
+    <p>Timestamps are monotonically increasing — all new writes land on the newest partition (today's range). One node saturates; rest idle. Classic hot spot. Fix: compound key (hash entity ID, sort by timestamp) or hash the timestamp if range scans aren't needed.</p>
+  </div>
+  <div class="quiz">
+    <h4>Q3: Hash partitioning spreads load but breaks what?</h4>
+    <p>Range queries on the primary key. Adjacent keys scatter to different partitions — "user:40 to user:50" must query all partitions (scatter/gather). Hash also can't fix a single hot key (celebrity ID) — same hash every time.</p>
+  </div>
+  <div class="quiz">
+    <h4>Q4: Explain compound key (user_id, timestamp) in one sentence.</h4>
+    <p>Hash <code>user_id</code> to pick the partition (even spread across users); sort by <code>timestamp</code> within the partition (cheap per-user time-range scans).</p>
+  </div>
+  <div class="quiz">
+    <h4>Q5: Local vs global secondary index — what's the trade?</h4>
+    <p><strong>Local (document-partitioned):</strong> write touches one partition; read scatter/gathers all partitions. <strong>Global (term-partitioned):</strong> read hits one partition; write may fan out to many index partitions → typically async (DynamoDB GSIs).</p>
+  </div>
+  <div class="quiz">
+    <h4>Q6: Why is hash(key) mod N an anti-pattern?</h4>
+    <p>When N (node count) changes, nearly every key's partition assignment changes — catastrophic rebalancing. Fixed partition count (move partition→node only) or dynamic split/merge avoids this.</p>
+  </div>
+  <div class="quiz">
+    <h4>Q7: Sensor network — walk through the three partitioning attempts.</h4>
+    <p>(1) Key-range on timestamp: cheap range scans, write hot spot on today's partition. (2) Hash timestamp: even writes, no cheap range scans. (3) Compound <code>(sensor_name, timestamp)</code>: hash sensor for even writes, sort by timestamp for per-sensor range queries. Multi-sensor global query = N targeted scans.</p>
+  </div>
+
+  <h3>Glossary</h3>
+  <table>
+    <tr><th>Term</th><th>Definition</th></tr>
+    <tr><td>Partition / shard</td><td>Subset of data; each record belongs to exactly one</td></tr>
+    <tr><td>Skew</td><td>Uneven load distribution across partitions</td></tr>
+    <tr><td>Hot spot</td><td>Partition with disproportionately high load</td></tr>
+    <tr><td>Key-range partitioning</td><td>Contiguous sorted key ranges per partition — cheap range scans, hot-spot risk</td></tr>
+    <tr><td>Hash partitioning</td><td>Hash key to pick partition — even load, no primary-key range queries</td></tr>
+    <tr><td>Compound primary key</td><td>Hash first column → partition; sort remaining columns within</td></tr>
+    <tr><td>Key salting</td><td>Append random suffix to hot key to spread writes (read gather cost)</td></tr>
+    <tr><td>Local secondary index</td><td>Index per partition — fast writes, scatter/gather reads</td></tr>
+    <tr><td>Global secondary index</td><td>Index partitioned by term — fast reads, multi-partition async writes</td></tr>
+    <tr><td>Scatter/gather</td><td>Query all partitions in parallel, merge results client-side</td></tr>
+    <tr><td>Fixed partitions</td><td>Many more partitions than nodes; rebalance moves partition→node only</td></tr>
+    <tr><td>Dynamic partitioning</td><td>Split/merge partitions by size threshold (B-tree-like)</td></tr>
+    <tr><td>hash mod N</td><td>Anti-pattern — most keys move when N changes</td></tr>
+    <tr><td>Pre-splitting</td><td>Create initial partition boundaries before data arrives (avoid single hot partition)</td></tr>
+  </table>
+</section>
+
+<footer class="page-footer">
+  DDIA Visual Guide · Chapter 6 · Source: claude-skills/ch06-partitioning.md · Next: Ch 7 Transactions
+</footer>
+
+</body>
+</html>

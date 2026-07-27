@@ -1,0 +1,672 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>DDIA Visual Guide — Chapter 11: Stream Processing</title>
+  <link rel="stylesheet" href="../assets/styles.css">
+</head>
+<body>
+
+<header class="cover">
+  <div class="series">Designing Data-Intensive Applications · Visual Companion</div>
+  <h1>Chapter 11<br>Stream Processing</h1>
+  <p class="subtitle">Unbounded data, ordered logs, and keeping derived systems in sync without dual-write</p>
+  <div class="badge">Source: claude-skills / ch11-stream-processing.md · Illustrated · Interview-ready</div>
+  <p class="meta" style="margin-top:2rem;">Martin Kleppmann · Part III: Derived Data</p>
+</header>
+
+<nav class="toc">
+  <h2>Table of Contents</h2>
+  <ol>
+    <li><a href="#core">Core Idea</a></li>
+    <li><a href="#kafka">Framework: Log-Based Kafka</a></li>
+    <li><a href="#amqp">Framework: AMQP/JMS Brokers</a></li>
+    <li><a href="#offsets">Partitioned Logs &amp; Consumer Offsets</a></li>
+    <li><a href="#compaction">Log Compaction</a></li>
+    <li><a href="#dual-write">Dual-Write Problem</a></li>
+    <li><a href="#cdc">Change Data Capture (CDC)</a></li>
+    <li><a href="#event-sourcing">Event Sourcing &amp; Commands vs Events</a></li>
+    <li><a href="#event-time">Event Time vs Processing Time</a></li>
+    <li><a href="#windows">Window Types</a></li>
+    <li><a href="#joins">Stream Joins</a></li>
+    <li><a href="#exactly-once">Exactly-Once Semantics</a></li>
+    <li><a href="#mental-models">Mental Models</a></li>
+    <li><a href="#anti-patterns">Anti-Patterns</a></li>
+    <li><a href="#worked-example">Worked Example: CDC Search Index Sync</a></li>
+    <li><a href="#problems-solved">Problems Each Mechanism Solves</a></li>
+    <li><a href="#connects">Connects To (Cross-Chapter)</a></li>
+    <li><a href="#takeaways">Key Takeaways</a></li>
+    <li><a href="#checkpoints">Junior SWE Checkpoints</a></li>
+  </ol>
+</nav>
+
+<!-- ═══ 1. CORE IDEA ═══ -->
+<section id="core">
+  <h2>1. Core Idea</h2>
+  <p>Batch assumes bounded input; real data is <strong>unbounded</strong>. Stream processing is the incremental counterpart: process every event as it happens instead of chunking by day.</p>
+
+  <div class="card-grid">
+    <div class="card"><h4>📊 Batch</h4><p>Bounded input, periodic jobs, reprocess whole dataset.</p></div>
+    <div class="card"><h4>🌊 Stream</h4><p>Unbounded input, incremental processing, low latency per event.</p></div>
+    <div class="card"><h4>🔄 Same coin</h4><p>Database writes <em>are</em> an event stream; expose the log and derived systems follow.</p></div>
+  </div>
+
+  <div class="callout key">
+    <strong>Databases and streams are two sides of the same coin.</strong> A replication log is already a stream of write events. Exposing it (CDC) or modeling the app on events (event sourcing) keeps caches, indexes, and warehouses consistent with one system of record.<br><br>
+    <em>"The truth is the log. The database is a cache of a subset of the log."</em> — Pat Helland
+  </div>
+</section>
+
+<!-- ═══ 2. KAFKA ═══ -->
+<section id="kafka">
+  <h2>2. Framework: Log-Based Kafka</h2>
+  <p><em>Also:</em> Amazon Kinesis Streams, Twitter DistributedLog, Kafka Streams, Samza. <strong>Default for data integration</strong> — high throughput, replay, derived state.</p>
+
+  <table>
+    <tr><th>When</th><td>High throughput, ordering within a key, consumers need replay, or the stream feeds derived state (indexes, caches, other streams).</td></tr>
+    <tr><th>How</th><td>Producers append to a <strong>partitioned, append-only log</strong> on disk. Each partition assigns a monotonically increasing <strong>offset</strong> per message. Consumer groups are assigned whole partitions; each consumer reads sequentially, single-threaded, periodically checkpointing its offset.</td></tr>
+    <tr><th>Why it works</th><td>Per-partition offset replaces per-message acks — broker behaves like a leader database, consumer like a follower resuming from a log sequence number. Kills ack bookkeeping; enables batching/pipelining at millions of msgs/sec while writing everything to disk.</td></tr>
+    <tr><th>Failure mode</th><td>Parallelism capped at partition count; one slow message head-of-line-blocks its partition; consumer lagging past segment retention silently misses messages; dying after processing but before committing offset → reprocessing on restart.</td></tr>
+  </table>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 680 320" xmlns="http://www.w3.org/2000/svg" font-family="Inter, sans-serif">
+      <text x="340" y="22" text-anchor="middle" font-weight="700" font-size="14">Log-based broker — partitioned append-only log</text>
+
+      <!-- Producers -->
+      <rect x="20" y="45" width="90" height="40" rx="6" fill="#d97706" stroke="#b45309"/>
+      <text x="65" y="70" text-anchor="middle" fill="white" font-size="11" font-weight="600">Producer A</text>
+      <rect x="20" y="95" width="90" height="40" rx="6" fill="#d97706" stroke="#b45309"/>
+      <text x="65" y="120" text-anchor="middle" fill="white" font-size="11" font-weight="600">Producer B</text>
+
+      <!-- Broker -->
+      <rect x="140" y="40" width="400" height="200" rx="10" fill="#f0f9ff" stroke="#2563eb" stroke-width="2"/>
+      <text x="340" y="62" text-anchor="middle" font-weight="700" font-size="12" fill="#2563eb">KAFKA BROKER (leader)</text>
+
+      <!-- Partition 0 -->
+      <rect x="160" y="75" width="110" height="145" rx="6" fill="white" stroke="#64748b"/>
+      <text x="215" y="95" text-anchor="middle" font-size="10" font-weight="600">Partition 0</text>
+      <rect x="170" y="105" width="90" height="18" rx="3" fill="#dbeafe"/><text x="215" y="118" text-anchor="middle" font-size="9">off:0 k=A</text>
+      <rect x="170" y="127" width="90" height="18" rx="3" fill="#dbeafe"/><text x="215" y="140" text-anchor="middle" font-size="9">off:1 k=B</text>
+      <rect x="170" y="149" width="90" height="18" rx="3" fill="#dbeafe"/><text x="215" y="162" text-anchor="middle" font-size="9">off:2 k=A</text>
+      <rect x="170" y="171" width="90" height="18" rx="3" fill="#bfdbfe"/><text x="215" y="184" text-anchor="middle" font-size="9" font-weight="600">off:3 ← head</text>
+      <text x="215" y="208" text-anchor="middle" font-size="8" fill="#64748b">total order here</text>
+
+      <!-- Partition 1 -->
+      <rect x="285" y="75" width="110" height="145" rx="6" fill="white" stroke="#64748b"/>
+      <text x="340" y="95" text-anchor="middle" font-size="10" font-weight="600">Partition 1</text>
+      <rect x="295" y="105" width="90" height="18" rx="3" fill="#d1fae5"/><text x="340" y="118" text-anchor="middle" font-size="9">off:0 k=C</text>
+      <rect x="295" y="127" width="90" height="18" rx="3" fill="#d1fae5"/><text x="340" y="140" text-anchor="middle" font-size="9">off:1 k=D</text>
+      <rect x="295" y="149" width="90" height="18" rx="3" fill="#d1fae5"/><text x="340" y="162" text-anchor="middle" font-size="9">off:2 k=C</text>
+      <text x="340" y="208" text-anchor="middle" font-size="8" fill="#64748b">no cross-partition order</text>
+
+      <!-- Partition 2 -->
+      <rect x="410" y="75" width="110" height="145" rx="6" fill="white" stroke="#64748b"/>
+      <text x="465" y="95" text-anchor="middle" font-size="10" font-weight="600">Partition 2</text>
+      <rect x="420" y="105" width="90" height="18" rx="3" fill="#fef3c7"/><text x="465" y="118" text-anchor="middle" font-size="9">off:0 k=E</text>
+      <rect x="420" y="127" width="90" height="18" rx="3" fill="#fef3c7"/><text x="465" y="140" text-anchor="middle" font-size="9">off:1 k=F</text>
+      <text x="465" y="208" text-anchor="middle" font-size="8" fill="#64748b">key → partition hash</text>
+
+      <!-- Consumer group -->
+      <rect x="570" y="55" width="90" height="45" rx="6" fill="#059669"/>
+      <text x="615" y="75" text-anchor="middle" fill="white" font-size="10" font-weight="600">Consumer 1</text>
+      <text x="615" y="90" text-anchor="middle" fill="#a7f3d0" font-size="8">P0, P1</text>
+      <rect x="570" y="115" width="90" height="45" rx="6" fill="#059669"/>
+      <text x="615" y="135" text-anchor="middle" fill="white" font-size="10" font-weight="600">Consumer 2</text>
+      <text x="615" y="150" text-anchor="middle" fill="#a7f3d0" font-size="8">P2</text>
+
+      <line x1="110" y1="65" x2="155" y2="120" stroke="#d97706" stroke-width="2" marker-end="url(#ko)"/>
+      <line x1="110" y1="115" x2="155" y2="160" stroke="#d97706" stroke-width="2" marker-end="url(#ko)"/>
+      <line x1="520" y1="130" x2="565" y2="78" stroke="#059669" stroke-width="2" marker-end="url(#kg)"/>
+      <line x1="520" y1="170" x2="565" y2="138" stroke="#059669" stroke-width="2" marker-end="url(#kg)"/>
+
+      <!-- Offset checkpoint -->
+      <rect x="140" y="255" width="400" height="50" rx="8" fill="#fef3c7" stroke="#d97706"/>
+      <text x="340" y="277" text-anchor="middle" font-size="11" font-weight="600">Offset checkpoint = entire consumer-progress protocol</text>
+      <text x="340" y="293" text-anchor="middle" font-size="10" fill="#92400e">Replay = reset offset · Consuming is read-only · At-least-once + idempotence</text>
+
+      <defs>
+        <marker id="ko" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L0,6 L8,3 z" fill="#d97706"/></marker>
+        <marker id="kg" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L0,6 L8,3 z" fill="#059669"/></marker>
+      </defs>
+    </svg>
+    <figcaption>Figure 2.1 — Kafka: partitioned log, offsets replace per-message acks, consumer groups read like followers.</figcaption>
+  </figure>
+
+  <div class="callout realworld">
+    <strong>Also named:</strong> Storm, Spark Streaming (microbatch), Flink (checkpointing), Google Cloud Dataflow, Debezium, Maxwell, Bottled Water, Kafka Connect, Esper (CEP), Event Store.
+  </div>
+</section>
+
+<!-- ═══ 3. AMQP ═══ -->
+<section id="amqp">
+  <h2>3. Framework: AMQP/JMS Brokers</h2>
+  <p><em>Also:</em> RabbitMQ, ActiveMQ, IBM MQ, Azure Service Bus. <strong>Task queues</strong> — async RPC, not data integration.</p>
+
+  <table>
+    <tr><th>When</th><td>Task queues — expensive per-message work, order unimportant, no replay needed. Think async RPC.</td></tr>
+    <tr><th>How</th><td>Broker assigns <strong>individual</strong> messages. Consumer acks each; broker <strong>deletes on ack</strong>. Load-balances across competing consumers.</td></tr>
+    <tr><th>Why it works</th><td>Simple per-message handoff; no log retention overhead; good for fire-and-forget jobs.</td></tr>
+    <tr><th>Failure mode</th><td>Load balancing + redelivery <strong>reorders</strong> messages (crashed consumer's unacked m3 redelivered after m4). Consuming is <strong>destructive</strong> — no re-runs; new consumer sees no history.</td></tr>
+  </table>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 620 180" xmlns="http://www.w3.org/2000/svg" font-family="Inter, sans-serif">
+      <text x="310" y="20" text-anchor="middle" font-weight="700" font-size="13">Two broker families, two contracts</text>
+      <rect x="30" y="35" width="250" height="130" rx="8" fill="#d1fae5" stroke="#059669"/>
+      <text x="155" y="58" text-anchor="middle" font-weight="700" font-size="11" fill="#047857">Log-based (Kafka)</text>
+      <text x="155" y="78" text-anchor="middle" font-size="10">Partitioned · Ordered · Replayable</text>
+      <text x="155" y="96" text-anchor="middle" font-size="10">Offset checkpoint · Fan-out free</text>
+      <text x="155" y="114" text-anchor="middle" font-size="10">Derived state · Data integration</text>
+      <text x="155" y="148" text-anchor="middle" font-size="9" fill="#059669" font-weight="600">Consumer = follower replaying log</text>
+      <rect x="340" y="35" width="250" height="130" rx="8" fill="#fee2e2" stroke="#dc2626"/>
+      <text x="465" y="58" text-anchor="middle" font-weight="700" font-size="11" fill="#991b1b">AMQP/JMS (RabbitMQ)</text>
+      <text x="465" y="78" text-anchor="middle" font-size="10">Per-message ack · Destructive</text>
+      <text x="465" y="96" text-anchor="middle" font-size="10">Unordered under redelivery</text>
+      <text x="465" y="114" text-anchor="middle" font-size="10">Task queue · Async RPC</text>
+      <text x="465" y="148" text-anchor="middle" font-size="9" fill="#dc2626" font-weight="600">No history for new consumers</text>
+    </svg>
+    <figcaption>Figure 3.1 — Pick the broker family by whether you need replay and ordered derived state.</figcaption>
+  </figure>
+
+  <div class="callout analogy">
+    <strong>📬 Kafka = library lending log</strong> (check out, return, re-read any page). <strong>AMQP = passing notes that burn after reading</strong> — fast handoff, no archive.
+  </div>
+</section>
+
+<!-- ═══ 4. OFFSETS ═══ -->
+<section id="offsets">
+  <h2>4. Partitioned Logs &amp; Consumer Offsets</h2>
+  <p>Total order <strong>within</strong> a partition only — none across partitions. Same key → same partition → per-key ordering preserved.</p>
+
+  <table>
+    <tr><th>Concept</th><th>Detail</th></tr>
+    <tr><td><strong>Offset</strong></td><td>Monotonically increasing position per partition. Replaces per-message ack bookkeeping.</td></tr>
+    <tr><td><strong>Consumer group</strong></td><td>Each partition assigned to exactly one consumer in the group. Parallelism = partition count.</td></tr>
+    <tr><td><strong>Checkpointing</strong></td><td>Consumer periodically commits offset = entire progress protocol. Replay = reset offset.</td></tr>
+    <tr><td><strong>Head-of-line blocking</strong></td><td>One slow message blocks its entire partition — can't skip ahead within a partition.</td></tr>
+    <tr><td><strong>Retention lag</strong></td><td>Consumer lagging past segment retention silently misses messages — monitor lag!</td></tr>
+  </table>
+
+  <div class="callout warning">
+    <strong>Crash between process and commit:</strong> event processed, offset not committed → reprocessing on restart. Plan for <strong>at-least-once + idempotence</strong>, not naive exactly-once assumptions.
+  </div>
+</section>
+
+<!-- ═══ 5. COMPACTION ═══ -->
+<section id="compaction">
+  <h2>5. Log Compaction</h2>
+  <p>Background process keeps only the <strong>latest value per key</strong> (null = tombstone/delete). Compacted log size tracks <em>database size</em>, not write history.</p>
+
+  <div class="callout key">
+    A topic can hold a <strong>full copy of a database</strong> forever. Kafka supports this natively — the load-bearing trick behind Kafka-as-storage and cheap rebuilds of derived views.
+  </div>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 620 160" xmlns="http://www.w3.org/2000/svg" font-family="Inter, sans-serif">
+      <text x="310" y="20" text-anchor="middle" font-weight="700" font-size="12">Before compaction → After compaction</text>
+      <text x="120" y="45" text-anchor="middle" font-size="10" font-weight="600">Write history</text>
+      <rect x="30" y="55" width="70" height="22" rx="3" fill="#dbeafe"/><text x="65" y="70" text-anchor="middle" font-size="8">k=A v=1</text>
+      <rect x="105" y="55" width="70" height="22" rx="3" fill="#dbeafe"/><text x="140" y="70" text-anchor="middle" font-size="8">k=B v=x</text>
+      <rect x="180" y="55" width="70" height="22" rx="3" fill="#dbeafe"/><text x="215" y="70" text-anchor="middle" font-size="8">k=A v=2</text>
+      <rect x="255" y="55" width="70" height="22" rx="3" fill="#dbeafe"/><text x="290" y="70" text-anchor="middle" font-size="8">k=A v=3</text>
+      <text x="120" y="100" text-anchor="middle" font-size="9" fill="#64748b">4 events, growing forever</text>
+      <text x="370" y="70" text-anchor="middle" font-size="18" fill="#2563eb">→</text>
+      <text x="500" y="45" text-anchor="middle" font-size="10" font-weight="600">Latest per key</text>
+      <rect x="430" y="55" width="70" height="22" rx="3" fill="#d1fae5"/><text x="465" y="70" text-anchor="middle" font-size="8">k=A v=3</text>
+      <rect x="510" y="55" width="70" height="22" rx="3" fill="#d1fae5"/><text x="545" y="70" text-anchor="middle" font-size="8">k=B v=x</text>
+      <text x="500" y="100" text-anchor="middle" font-size="9" fill="#64748b">Size ≈ DB size</text>
+      <rect x="30" y="115" width="560" height="35" rx="6" fill="#f0f9ff" stroke="#2563eb"/>
+      <text x="310" y="137" text-anchor="middle" font-size="10">New consumer: start offset 0, scan to head → caught up. No snapshot coordination.</text>
+    </svg>
+    <figcaption>Figure 5.1 — Compacted topic = durable full dataset for bootstrap without DB load.</figcaption>
+  </figure>
+</section>
+
+<!-- ═══ 6. DUAL-WRITE ═══ -->
+<section id="dual-write">
+  <h2>6. Dual-Write Problem</h2>
+  <p>App writes DB, then index, then cache — two failure modes guarantee silent divergence:</p>
+
+  <div class="card-grid">
+    <div class="card"><h4>Race</h4><p>Concurrent clients interleave: DB ends with B, index with A — permanently inconsistent, <strong>no error raised</strong>.</p></div>
+    <div class="card"><h4>Partial failure</h4><p>DB write succeeds, index write fails — systems desync with no rollback.</p></div>
+    <div class="card"><h4>Root cause</h4><p><strong>No single leader</strong> ordering writes across systems.</p></div>
+  </div>
+
+  <div class="callout pitfall">
+    <strong>🚨 The dual-write trap</strong><br>
+    Request path: <code>UPDATE users SET name='Alice' → Elasticsearch.index(user) → Redis.set(user)</code><br>
+    Two concurrent updates to the same user can land in different orders in each store. You can't detect it, can't fix it retroactively. <strong>Fix:</strong> one system of record + CDC/event log; derived stores are followers.
+  </div>
+</section>
+
+<!-- ═══ 7. CDC ═══ -->
+<section id="cdc">
+  <h2>7. Change Data Capture (CDC)</h2>
+  <p>Parse the DB's replication log, publish changes as a stream: DB becomes <strong>leader</strong>, derived systems become <strong>followers</strong> applying the <em>same</em> order.</p>
+
+  <table>
+    <tr><th>When</th><td>Keep cache, search index, warehouse, or analytics in sync without dual-write.</td></tr>
+    <tr><th>How</th><td>CDC connector (Debezium, Maxwell, Bottled Water) tails binlog/WAL → publishes keyed change events to Kafka. Consumers apply in log order.</td></tr>
+    <tr><th>Bootstrap</th><td>Raw log is truncated — normally need snapshot tied to log offset. <strong>Or:</strong> compacted topic with full row per event → no snapshot needed.</td></tr>
+    <tr><th>Caveat</th><td>Async — replication lag applies. User may not see own write in search (read-your-writes violation on derived store).</td></tr>
+  </table>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 680 280" xmlns="http://www.w3.org/2000/svg" font-family="Inter, sans-serif">
+      <text x="340" y="22" text-anchor="middle" font-weight="700" font-size="14">CDC pipeline — one leader, many followers</text>
+
+      <!-- OLTP DB -->
+      <rect x="30" y="50" width="120" height="70" rx="8" fill="#2563eb"/>
+      <text x="90" y="78" text-anchor="middle" fill="white" font-weight="700" font-size="12">OLTP DB</text>
+      <text x="90" y="96" text-anchor="middle" fill="#bfdbfe" font-size="9">system of record</text>
+      <text x="90" y="110" text-anchor="middle" fill="#bfdbfe" font-size="9">clients write here only</text>
+
+      <!-- Replication log -->
+      <rect x="180" y="55" width="100" height="60" rx="6" fill="#fef3c7" stroke="#d97706"/>
+      <text x="230" y="78" text-anchor="middle" font-size="10" font-weight="600">binlog / WAL</text>
+      <text x="230" y="94" text-anchor="middle" font-size="9">total order</text>
+      <text x="230" y="108" text-anchor="middle" font-size="9">of all writes</text>
+
+      <!-- CDC connector -->
+      <rect x="310" y="55" width="100" height="60" rx="6" fill="#d97706"/>
+      <text x="360" y="78" text-anchor="middle" fill="white" font-size="10" font-weight="600">Debezium</text>
+      <text x="360" y="94" text-anchor="middle" fill="#fef3c7" font-size="9">CDC connector</text>
+      <text x="360" y="108" text-anchor="middle" fill="#fef3c7" font-size="9">parse → publish</text>
+
+      <!-- Kafka -->
+      <rect x="440" y="40" width="220" height="90" rx="8" fill="#f0f9ff" stroke="#2563eb" stroke-width="2"/>
+      <text x="550" y="62" text-anchor="middle" font-weight="700" font-size="11" fill="#2563eb">Kafka topic</text>
+      <text x="550" y="80" text-anchor="middle" font-size="9">keyed by PK → same partition</text>
+      <text x="550" y="96" text-anchor="middle" font-size="9">value = full new row</text>
+      <text x="550" y="112" text-anchor="middle" font-size="9" fill="#64748b">fan-out is free on a log</text>
+
+      <!-- Arrows top row -->
+      <line x1="150" y1="85" x2="175" y2="85" stroke="#2563eb" stroke-width="2" marker-end="url(#cd1)"/>
+      <line x1="280" y1="85" x2="305" y2="85" stroke="#d97706" stroke-width="2" marker-end="url(#cd2)"/>
+      <line x1="410" y1="85" x2="435" y2="85" stroke="#d97706" stroke-width="2" marker-end="url(#cd2)"/>
+
+      <!-- Consumers -->
+      <rect x="80" y="170" width="130" height="50" rx="6" fill="#059669"/>
+      <text x="145" y="192" text-anchor="middle" fill="white" font-size="11" font-weight="600">Elasticsearch</text>
+      <text x="145" y="208" text-anchor="middle" fill="#a7f3d0" font-size="9">search index consumer</text>
+
+      <rect x="275" y="170" width="130" height="50" rx="6" fill="#059669"/>
+      <text x="340" y="192" text-anchor="middle" fill="white" font-size="11" font-weight="600">Redis cache</text>
+      <text x="340" y="208" text-anchor="middle" fill="#a7f3d0" font-size="9">inventory cache consumer</text>
+
+      <rect x="470" y="170" width="130" height="50" rx="6" fill="#059669"/>
+      <text x="535" y="192" text-anchor="middle" fill="white" font-size="11" font-weight="600">Data warehouse</text>
+      <text x="535" y="208" text-anchor="middle" fill="#a7f3d0" font-size="9">analytics consumer</text>
+
+      <line x1="500" y1="130" x2="145" y2="165" stroke="#059669" stroke-width="2" stroke-dasharray="4,3" marker-end="url(#cd3)"/>
+      <line x1="550" y1="130" x2="340" y2="165" stroke="#059669" stroke-width="2" stroke-dasharray="4,3" marker-end="url(#cd3)"/>
+      <line x1="600" y1="130" x2="535" y2="165" stroke="#059669" stroke-width="2" stroke-dasharray="4,3" marker-end="url(#cd3)"/>
+
+      <rect x="30" y="240" width="620" height="30" rx="6" fill="#d1fae5" stroke="#059669"/>
+      <text x="340" y="260" text-anchor="middle" font-size="10" fill="#047857">State machine replication: apply changes in log order → converges to DB state · "set key=row" is idempotent</text>
+
+      <defs>
+        <marker id="cd1" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L0,6 L8,3 z" fill="#2563eb"/></marker>
+        <marker id="cd2" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L0,6 L8,3 z" fill="#d97706"/></marker>
+        <marker id="cd3" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L0,6 L8,3 z" fill="#059669"/></marker>
+      </defs>
+    </svg>
+    <figcaption>Figure 7.1 — CDC: DB leader, Kafka log, derived stores as independent consumers.</figcaption>
+  </figure>
+
+  <div class="callout realworld">
+    <strong>Real systems:</strong> Debezium (Postgres WAL, MySQL binlog), Maxwell, Bottled Water, Kafka Connect. Hotel reservation Redis cache, email service Elasticsearch reindex (Ch 5 logical log → Ch 11 CDC).
+  </div>
+</section>
+
+<!-- ═══ 8. EVENT SOURCING ═══ -->
+<section id="event-sourcing">
+  <h2>8. Event Sourcing &amp; Commands vs Events</h2>
+
+  <p><strong>Event sourcing</strong> — same log idea at the application level: append-only log of immutable, intent-carrying domain events ("seat reserved"), state derived by deterministic replay.</p>
+
+  <div class="callout key">
+    Later events don't supersede earlier ones (unlike CDC row updates), so <strong>compaction doesn't apply</strong> — snapshot state as a performance optimization only.
+  </div>
+
+  <h3>Commands vs Events</h3>
+  <table>
+    <tr><th>Type</th><th>Properties</th><th>Handling</th></tr>
+    <tr>
+      <td><strong>Command</strong></td>
+      <td>Intent — may fail validation ("reserve seat 7A")</td>
+      <td>Validate synchronously <em>before</em> append</td>
+    </tr>
+    <tr>
+      <td><strong>Event</strong></td>
+      <td>Fact — immutable once accepted ("SeatReserved{7A, user42}")</td>
+      <td>Consumers cannot reject events. Split into tentative + confirmation if needed.</td>
+    </tr>
+  </table>
+
+  <div class="callout analogy">
+    <strong>📒 Accountant's ledger:</strong> never erase — append a compensating event. Immutability buys auditability, recovery from buggy deploys, and new read views derived from history. <strong>CQRS:</strong> write shape ≠ read shape, so denormalizing read views is safe.
+  </div>
+</section>
+
+<!-- ═══ 9. EVENT TIME ═══ -->
+<section id="event-time">
+  <h2>9. Event Time vs Processing Time</h2>
+
+  <p>Windowing on the processor's clock creates artifacts — a restarted processor's backlog looks like a request spike. <strong>Window on event timestamps.</strong></p>
+
+  <table>
+    <tr><th>Timestamp</th><th>Source</th><th>Problem</th></tr>
+    <tr><td><strong>Event time</strong></td><td>When the event actually occurred (device clock)</td><td>Correct for analytics; windows may never be "complete"</td></tr>
+    <tr><td><strong>Processing time</strong></td><td>When the processor handles the event</td><td>Redeploys/lag manufacture fake traffic spikes</td></tr>
+    <tr><td><strong>Ingestion time</strong></td><td>When server received the event</td><td>Server clock more reliable than device</td></tr>
+  </table>
+
+  <div class="callout warning">
+    <strong>Stragglers:</strong> events arrive late — you can never be sure a window is complete. Either <strong>drop them</strong> (track how many) or <strong>emit a correction</strong>. Device clocks lie: log three timestamps (occurred, sent per device clock, received per server clock) to estimate offset.
+  </div>
+</section>
+
+<!-- ═══ 10. WINDOWS ═══ -->
+<section id="windows">
+  <h2>10. Window Types</h2>
+
+  <table>
+    <tr><th>Type</th><th>Behavior</th><th>Use when</th></tr>
+    <tr>
+      <td><strong>Tumbling</strong></td>
+      <td>Fixed length, non-overlapping (e.g. 5-min buckets)</td>
+      <td>Periodic rollups — metrics per minute</td>
+    </tr>
+    <tr>
+      <td><strong>Hopping</strong></td>
+      <td>Fixed length, overlaps by hop size (e.g. 5-min window, 1-min hop)</td>
+      <td>Smoothed moving averages</td>
+    </tr>
+    <tr>
+      <td><strong>Sliding</strong></td>
+      <td>All events within an interval of each other — no fixed boundaries</td>
+      <td>"Events within 30s of each other"</td>
+    </tr>
+    <tr>
+      <td><strong>Session</strong></td>
+      <td>No fixed length; closes on inactivity gap (e.g. 30 min idle)</td>
+      <td>User sessions, click streams</td>
+    </tr>
+  </table>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 620 200" xmlns="http://www.w3.org/2000/svg" font-family="Inter, sans-serif">
+      <text x="310" y="18" text-anchor="middle" font-weight="700" font-size="12">Window types on a timeline</text>
+      <line x1="40" y1="100" x2="580" y2="100" stroke="#64748b" stroke-width="2"/>
+      <text x="40" y="115" font-size="9" fill="#64748b">t0</text>
+      <text x="580" y="115" font-size="9" fill="#64748b">t→</text>
+
+      <!-- Tumbling -->
+      <text x="40" y="40" font-size="10" font-weight="600">Tumbling</text>
+      <rect x="80" y="48" width="100" height="20" rx="3" fill="#2563eb" opacity="0.7"/>
+      <rect x="180" y="48" width="100" height="20" rx="3" fill="#2563eb" opacity="0.7"/>
+      <rect x="280" y="48" width="100" height="20" rx="3" fill="#2563eb" opacity="0.7"/>
+
+      <!-- Hopping -->
+      <text x="40" y="75" font-size="10" font-weight="600">Hopping</text>
+      <rect x="100" y="83" width="120" height="14" rx="2" fill="#059669" opacity="0.5"/>
+      <rect x="160" y="83" width="120" height="14" rx="2" fill="#059669" opacity="0.5"/>
+      <rect x="220" y="83" width="120" height="14" rx="2" fill="#059669" opacity="0.5"/>
+
+      <!-- Session -->
+      <text x="40" y="145" font-size="10" font-weight="600">Session</text>
+      <rect x="120" y="130" width="80" height="18" rx="3" fill="#d97706" opacity="0.7"/>
+      <text x="220" y="143" font-size="8" fill="#64748b">gap</text>
+      <rect x="280" y="130" width="140" height="18" rx="3" fill="#d97706" opacity="0.7"/>
+      <text x="440" y="143" font-size="8" fill="#64748b">gap</text>
+      <rect x="480" y="130" width="60" height="18" rx="3" fill="#d97706" opacity="0.7"/>
+
+      <text x="310" y="185" text-anchor="middle" font-size="10" fill="#64748b">Always use event time · decide straggler policy upfront</text>
+    </svg>
+    <figcaption>Figure 10.1 — Pick window semantics deliberately; processing-time windows lie under lag.</figcaption>
+  </figure>
+</section>
+
+<!-- ═══ 11. JOINS ═══ -->
+<section id="joins">
+  <h2>11. Stream Joins</h2>
+  <p>All three join types reduce to: <strong>maintain state from one input, probe from the other.</strong> Cross-stream ordering is undefined → joins are nondeterministic on replay.</p>
+
+  <table>
+    <tr><th>Join type</th><th>Pattern</th><th>Example</th></tr>
+    <tr>
+      <td><strong>Stream-stream</strong></td>
+      <td>Window join: both sides indexed in local state within a time window</td>
+      <td>Search event + click event by session ID → click-through rate</td>
+    </tr>
+    <tr>
+      <td><strong>Stream-table</strong></td>
+      <td>Enrichment via CDC-fed local replica instead of remote DB per event</td>
+      <td>Click event joined with user profile from changelog-maintained table</td>
+    </tr>
+    <tr>
+      <td><strong>Table-table</strong></td>
+      <td>Join two changelogs to maintain a materialized view</td>
+      <td>Twitter timelines — tweets changelog × follows changelog</td>
+    </tr>
+  </table>
+
+  <div class="callout warning">
+    <strong>Don't embed search details in click events</strong> instead of joining — loses no-click searches; click-through rate becomes uncomputable. <strong>Don't query remote DB per event</strong> — slow, overloads DB; keep CDC-fed local replica.
+  </div>
+
+  <div class="callout key">
+    Materialized join follows the product rule: (u·v)′ = u′v + uv′ — state is the integral of the change stream.
+  </div>
+</section>
+
+<!-- ═══ 12. EXACTLY-ONCE ═══ -->
+<section id="exactly-once">
+  <h2>12. Exactly-Once Semantics</h2>
+  <p>The <strong>visible effect</strong> is as-if-once even though retries reprocess. Not a magic delivery mode — built from at-least-once + careful output handling.</p>
+
+  <table>
+    <tr><th>Layer</th><th>Mechanism</th><th>Limit</th></tr>
+    <tr>
+      <td><strong>Inside framework</strong></td>
+      <td>Microbatching (Spark Streaming), checkpointing with barriers (Flink)</td>
+      <td>Works within the processor</td>
+    </tr>
+    <tr>
+      <td><strong>Output escapes</strong></td>
+      <td>DB writes, emails, external APIs</td>
+      <td>Need atomic commit of output + state + offset, <strong>or idempotence</strong></td>
+    </tr>
+    <tr>
+      <td><strong>Idempotence pattern</strong></td>
+      <td>Write Kafka offset alongside value in target DB; skip already-applied updates</td>
+      <td>Requires deterministic processing, identical replay order (log gives this), fencing against zombie nodes</td>
+    </tr>
+  </table>
+
+  <div class="decision-tree">
+    <div class="step"><span class="num">1</span><div><strong>At-least-once delivery</strong> — accept retries, commit offset after processing</div></div>
+    <div class="step"><span class="num">2</span><div><strong>Idempotent writes</strong> — "set key=row" or dedup by event ID/offset</div></div>
+    <div class="step"><span class="num">3</span><div><strong>Atomic commit</strong> — 2PC: output + state + offset in one transaction (Ch 7/9)</div></div>
+    <div class="step"><span class="num">4</span><div><strong>Fencing</strong> — prevent zombie processors from writing stale results (Ch 9)</div></div>
+  </div>
+
+  <div class="callout pitfall">
+    <strong>🚨 At-least-once redelivery without idempotence</strong> — every retry double-counts. A few percent double-counting error is real financial loss in ad click aggregation.
+  </div>
+</section>
+
+<!-- ═══ 13. MENTAL MODELS ═══ -->
+<section id="mental-models">
+  <h2>13. Mental Models</h2>
+
+  <div class="card-grid">
+    <div class="card">
+      <h4>1. Streams ↔ tables (calculus duals)</h4>
+      <p>State is the <strong>integral</strong> of the change stream; the changelog is the <strong>derivative</strong> of state. Materialized join: (u·v)′ = u′v + uv′.</p>
+    </div>
+    <div class="card">
+      <h4>2. Broker as leader, consumer as follower</h4>
+      <p>Log-based broker is database replication wearing a different hat. Offsets are log sequence numbers (Ch 5).</p>
+    </div>
+    <div class="card">
+      <h4>3. CEP inverts the database</h4>
+      <p>Databases store data, queries are transient. CEP stores queries long-term, streams data past them (Esper).</p>
+    </div>
+    <div class="card">
+      <h4>4. The accountant's ledger</h4>
+      <p>Never erase — append compensating events. Immutability → auditability, replay, new read views. CQRS: write shape ≠ read shape.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ═══ 14. ANTI-PATTERNS ═══ -->
+<section id="anti-patterns">
+  <h2>14. Anti-Patterns</h2>
+  <table>
+    <tr><th>Anti-pattern</th><th>Why it fails</th></tr>
+    <tr><td><strong>Dual writes</strong> to keep systems in sync</td><td>Races and partial failures guarantee silent divergence. Use CDC / single ordered log.</td></tr>
+    <tr><td><strong>Windowing by processing time</strong> when lag is possible</td><td>Redeploys manufacture fake traffic spikes.</td></tr>
+    <tr><td><strong>At-least-once redelivery without idempotence</strong></td><td>Every retry double-counts — real financial loss in ad aggregation.</td></tr>
+    <tr><td>Embedding search details in click events <strong>instead of joining</strong></td><td>Loses no-click searches; click-through rate uncomputable.</td></tr>
+    <tr><td>Querying a <strong>remote DB per event</strong> for enrichment</td><td>Slow, overloads DB; keep CDC-fed local replica.</td></tr>
+    <tr><td>Assuming event log satisfies <strong>deletion regulations</strong></td><td>Need excision-style history rewrite; truly deleting is hard (SSDs, backups).</td></tr>
+  </table>
+</section>
+
+<!-- ═══ 15. WORKED EXAMPLE ═══ -->
+<section id="worked-example">
+  <h2>15. Worked Example: CDC Search Index Sync</h2>
+
+  <div class="decision-tree">
+    <div class="step"><span class="num">1</span><div><strong>OLTP database</strong> is system of record; clients write only to it. Replication log totally orders every write.</div></div>
+    <div class="step"><span class="num">2</span><div><strong>CDC connector</strong> (Debezium) publishes each change — keyed by PK, value = full new row — to Kafka topic partitioned by key. Same key → same partition → per-key ordering preserved.</div></div>
+    <div class="step"><span class="num">3</span><div><strong>Search index consumer</strong> applies changes in log order → state converges to DB (state machine replication). Cache and warehouse are additional consumers — fan-out is free.</div></div>
+    <div class="step"><span class="num">4</span><div><strong>Bootstrap new index:</strong> enable log compaction — each event carries full latest row, compacted topic <em>is</em> a full DB copy. New consumer starts offset 0, scans to head, caught up. No snapshot coordination, no load on source DB.</div></div>
+    <div class="step"><span class="num">5</span><div><strong>Fault tolerance:</strong> commit offsets after applying writes. Crash → few events replay. "Set key=row" is naturally idempotent → exactly-once effect without transactions.</div></div>
+    <div class="step"><span class="num">6</span><div><strong>Caveat:</strong> CDC is async — replication lag applies. User may not see own write in search (read-your-writes violation on derived store).</div></div>
+  </div>
+
+  <pre>User updates profile name in Postgres.
+  → binlog: {op: UPDATE, pk: 42, after: {name: "Alice", ...}}
+  → Debezium → Kafka topic "users" partition = hash(42)
+  → ES consumer: PUT /users/42 {name: "Alice", ...}
+  → Redis consumer: SET user:42 {name: "Alice", ...}
+  → Both converge. No dual-write in request path.
+
+Crash after ES write, before offset commit:
+  → Restart, replay from last committed offset
+  → ES PUT same doc again → idempotent, no duplicate</pre>
+
+  <div class="callout key">
+    <strong>Edge case:</strong> User searches immediately after profile update — ES may still show old name (async lag). Fix: read-your-writes routing (query leader/DB for own data) or accept bounded staleness.
+  </div>
+</section>
+
+<!-- ═══ 16. PROBLEMS SOLVED ═══ -->
+<section id="problems-solved">
+  <h2>16. Problems Each Mechanism Solves</h2>
+  <table>
+    <tr><th>Mechanism</th><th>Problem it solves</th><th>Example</th></tr>
+    <tr><td>At-least-once + idempotent dedup via event ID</td><td>Retried sends must not double-notify</td><td>Notification system (APNS/FCM)</td></tr>
+    <tr><td>Stream-maintained materialized view</td><td>Precompute feed instead of fan-out read at request time</td><td>News feed system</td></tr>
+    <tr><td>Per-recipient inbox + consumer-offset sync</td><td>Multiple devices, independent resumable read positions</td><td>Chat system</td></tr>
+    <tr><td>Unbounded per-user pub/sub stream</td><td>Continuous location updates, not request/response</td><td>Nearby friends</td></tr>
+    <tr><td>Kafka stream feeding downstream consumers</td><td>Location/traffic updates reach ETA without polling</td><td>Google Maps</td></tr>
+    <tr><td>Partitions, offsets, consumer groups, exactly-once</td><td>The system <em>is</em> a message queue</td><td>Distributed message queue</td></tr>
+    <tr><td>Windowed aggregation + explicit aggregate point</td><td>Metrics roll up before storage, re-sliceable</td><td>Metrics monitoring &amp; alerting</td></tr>
+    <tr><td>Watermarks, tumbling/sliding windows, offset-atomic-with-write</td><td>Late events guaranteed; double-counting = financial loss</td><td>Ad click event aggregation</td></tr>
+    <tr><td>CDC keeping derived cache in sync</td><td>Cache reflects DB without fragile dual-write</td><td>Hotel reservation (Redis inventory cache)</td></tr>
+    <tr><td>Async reindexing via Kafka</td><td>Search index consistent without dual-write in request path</td><td>Email service (Elasticsearch reindex)</td></tr>
+    <tr><td>Retry queue / dead-letter queue, multi-receiver pub-sub</td><td>Side effects on payment events retried safely, fanned out</td><td>Payment system</td></tr>
+    <tr><td>Event sourcing + CQRS, deterministic replay</td><td>Full audit trail, reconstruct any past state</td><td>Digital wallet</td></tr>
+    <tr><td>Event sourcing over append-only log</td><td>Matching engine state reconstructable for audit/replay</td><td>Stock exchange</td></tr>
+  </table>
+</section>
+
+<!-- ═══ 17. CONNECTS TO ═══ -->
+<section id="connects">
+  <h2>17. Connects To (Cross-Chapter)</h2>
+  <table>
+    <tr><th>Chapter</th><th>Connection</th><th>Interview soundbite</th></tr>
+    <tr><td><strong>Ch 3 Storage</strong></td><td>Log-structured engines and compaction — same log mechanics.</td><td>"Kafka compaction is SSTable merge for messages."</td></tr>
+    <tr><td><strong>Ch 5 Replication</strong></td><td>Replication logs, LSNs, lag, read-your-writes — broker/consumer is leader/follower.</td><td>"Consumer offset = follower's log sequence number."</td></tr>
+    <tr><td><strong>Ch 6 Partitioning</strong></td><td>Topic partitioning is the same idea applied to logs.</td><td>"Partition count caps consumer parallelism."</td></tr>
+    <tr><td><strong>Ch 7/9 Transactions</strong></td><td>Atomic commit/2PC for exactly-once output; total order broadcast = log; fencing zombies.</td><td>"Exactly-once output needs atomic commit or idempotence."</td></tr>
+    <tr><td><strong>Ch 8 Distributed Troubles</strong></td><td>Unreliable clocks and networks are why event time is hard.</td><td>"Never window on processing time under lag."</td></tr>
+    <tr><td><strong>Ch 10 Batch</strong></td><td>Stream = batch with unbounded input; map-side joins → stream-table joins; exactly-once same discipline, incrementally.</td><td>"Batch and stream are the same math, different scheduling."</td></tr>
+  </table>
+</section>
+
+<!-- ═══ 18. TAKEAWAYS ═══ -->
+<section id="takeaways">
+  <h2>18. Key Takeaways</h2>
+  <ol>
+    <li><strong>Two broker families, two contracts:</strong> AMQP/JMS = per-message ack, destructive, unordered under redelivery (task queues); log-based Kafka = partitioned, ordered, replayable (data integration, derived state).</li>
+    <li><strong>Database writes are an event stream;</strong> CDC + log fixes dual-write by making one system leader and everything else followers.</li>
+    <li><strong>Log compaction</strong> turns a topic into a durable full dataset — load-bearing trick for Kafka-as-storage and cheap derived view rebuilds.</li>
+    <li><strong>State is a cache of the log's latest values;</strong> keep the log and re-derive anything, run old/new views side by side, recover from bad deploys.</li>
+    <li><strong>Distinguish event time from processing time;</strong> pick window semantics deliberately; decide straggler policy upfront.</li>
+    <li><strong>All three join types</strong> reduce to "maintain state from one side, probe from the other" — order-sensitive across streams.</li>
+    <li><strong>Exactly-once is a visible-effect guarantee</strong> built from at-least-once + (atomic commit or idempotent writes keyed by offset), not a magic delivery mode.</li>
+  </ol>
+</section>
+
+<!-- ═══ 19. CHECKPOINTS ═══ -->
+<section id="checkpoints">
+  <h2>19. Junior SWE Checkpoints</h2>
+
+  <div class="quiz">
+    <h4>Q1: Kafka vs RabbitMQ — when do you pick each?</h4>
+    <p><strong>Kafka:</strong> ordered replay, derived state, data integration, fan-out to many consumers. <strong>RabbitMQ:</strong> task queue, async RPC, order unimportant, no replay needed. Different contracts — not interchangeable.</p>
+  </div>
+  <div class="quiz">
+    <h4>Q2: Why is dual-write dangerous?</h4>
+    <p>No single leader orders writes across DB + index + cache. Concurrent clients race; partial failures desync. Silent divergence, no error raised. Fix: CDC — one system of record, derived stores follow the log.</p>
+  </div>
+  <div class="quiz">
+    <h4>Q3: What does log compaction enable for a new search index consumer?</h4>
+    <p>Compacted topic holds latest value per key ≈ full DB copy. New consumer starts offset 0, scans to head, caught up — no snapshot coordination, no load on source DB.</p>
+  </div>
+  <div class="quiz">
+    <h4>Q4: Event time vs processing time — why does it matter?</h4>
+    <p>Processing-time windows shift when processor lags or redeploys — backlog looks like traffic spike. Event-time windows are correct for analytics but stragglers arrive late; window never truly "complete."</p>
+  </div>
+  <div class="quiz">
+    <h4>Q5: How do you get exactly-once effect with at-least-once delivery?</h4>
+    <p>Idempotent writes (set key=row, dedup by offset/event ID) or atomic commit of output + state + offset (2PC). Requires deterministic processing, identical replay order, fencing against zombie processors.</p>
+  </div>
+  <div class="quiz">
+    <h4>Q6: What's the difference between CDC and event sourcing?</h4>
+    <p>CDC tails DB replication log — row-level changes, compaction applies (latest row per key). Event sourcing is app-level immutable domain events — later events don't supersede, compaction doesn't apply, snapshots for perf only.</p>
+  </div>
+
+  <h3>Glossary</h3>
+  <table>
+    <tr><th>Term</th><th>Definition</th></tr>
+    <tr><td>Offset</td><td>Monotonic position per partition — replaces per-message acks</td></tr>
+    <tr><td>Consumer group</td><td>Cooperative consumers; each partition assigned to one member</td></tr>
+    <tr><td>Log compaction</td><td>Keep latest value per key; topic size ≈ DB size</td></tr>
+    <tr><td>CDC</td><td>Change Data Capture — tail replication log, publish as stream</td></tr>
+    <tr><td>Event sourcing</td><td>Append-only domain events; state by deterministic replay</td></tr>
+    <tr><td>Command vs event</td><td>Command = intent (may fail); event = immutable fact</td></tr>
+    <tr><td>Event time</td><td>When event occurred — correct for windowing</td></tr>
+    <tr><td>Straggler</td><td>Late-arriving event after window supposedly closed</td></tr>
+    <tr><td>Stream-stream join</td><td>Both streams windowed and indexed in local state</td></tr>
+    <tr><td>Stream-table join</td><td>Enrich stream from CDC-maintained local table replica</td></tr>
+    <tr><td>Exactly-once</td><td>Visible effect as-if-once — not magic, built from at-least-once + idempotence</td></tr>
+    <tr><td>CQRS</td><td>Command Query Responsibility Segregation — write shape ≠ read shape</td></tr>
+    <tr><td>Watermark</td><td>Estimate of how complete event-time progress is</td></tr>
+    <tr><td>Dead-letter queue</td><td>Failed messages routed for inspection/retry</td></tr>
+  </table>
+</section>
+
+<footer class="page-footer">
+  DDIA Visual Guide · Chapter 11 · Source: claude-skills/ch11-stream-processing.md · Prev: Ch 10 Batch · Next: Ch 12 The Future of Data Systems
+</footer>
+
+</body>
+</html>

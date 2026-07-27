@@ -1,0 +1,550 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>DDIA Visual Guide — Chapter 7: Transactions</title>
+  <link rel="stylesheet" href="../assets/styles.css">
+</head>
+<body>
+
+<header class="cover">
+  <div class="series">Designing Data-Intensive Applications · Visual Companion</div>
+  <h1>Chapter 7<br>Transactions</h1>
+  <p class="subtitle">Grouping reads and writes into one unit — and choosing which races the database actually prevents</p>
+  <div class="badge">Source: claude-skills / ch07-transactions.md · Illustrated · Interview-ready</div>
+  <p class="meta" style="margin-top:2rem;">Martin Kleppmann · Part II: Distributed Data</p>
+</header>
+
+<nav class="toc">
+  <h2>Table of Contents</h2>
+  <ol>
+    <li><a href="#core">Core Idea</a></li>
+    <li><a href="#acid">Framework: ACID</a></li>
+    <li><a href="#isolation-ladder">The Isolation Level Ladder</a></li>
+    <li><a href="#anomalies">Anomaly-to-Level Mapping</a></li>
+    <li><a href="#mvcc">MVCC — Snapshot Isolation Implementation</a></li>
+    <li><a href="#2pl">Two-Phase Locking (2PL)</a></li>
+    <li><a href="#serial-execution">Actual Serial Execution</a></li>
+    <li><a href="#ssi">Serializable Snapshot Isolation (SSI)</a></li>
+    <li><a href="#mental-models">Mental Models</a></li>
+    <li><a href="#anti-patterns">Anti-Patterns</a></li>
+    <li><a href="#worked-example">Worked Example: Doctors On-Call Write Skew</a></li>
+    <li><a href="#problems-solved">Problems Each Mechanism Solves</a></li>
+    <li><a href="#connects">Connects To (Cross-Chapter)</a></li>
+    <li><a href="#takeaways">Key Takeaways</a></li>
+    <li><a href="#checkpoints">Junior SWE Checkpoints</a></li>
+  </ol>
+</nav>
+
+<!-- ═══ 1. CORE IDEA ═══ -->
+<section id="core">
+  <h2>1. Core Idea</h2>
+  <p>A transaction groups reads and writes into one unit that either <strong>commits entirely</strong> or <strong>aborts entirely</strong>, so the application can safely retry instead of reasoning about partial failure.</p>
+  <div class="card-grid">
+    <div class="card"><h4>🔄 Safe retry</h4><p>Abort on fault → discard partial writes → app retries the whole unit.</p></div>
+    <div class="card"><h4>🧠 Simpler programming</h4><p>Transactions exist to simplify the model — not a law of nature.</p></div>
+    <div class="card"><h4>⚔️ Concurrency control</h4><p>The real payload: which race conditions exist, which isolation level prevents which.</p></div>
+  </div>
+  <div class="callout key">
+    <strong>Weak isolation has caused real money loss.</strong> "Use an ACID database" is no protection — most "ACID" databases run <strong>weak isolation by default</strong>. The chapter's job is mapping anomalies to levels and understanding the three roads to serializability: serial execution, 2PL, and SSI.
+  </div>
+</section>
+
+<!-- ═══ 2. ACID ═══ -->
+<section id="acid">
+  <h2>2. Framework: ACID</h2>
+  <p><em>Härder &amp; Reuter, 1983.</em> Use as vocabulary, not a guarantee — Kleppmann calls "ACID compliant" mostly a marketing term. <strong>BASE</strong> is even vaguer: effectively "not ACID."</p>
+
+  <table>
+    <tr><th>Letter</th><th>What it means</th><th>What it does <em>not</em> mean</th></tr>
+    <tr>
+      <td><strong>A — Atomicity</strong></td>
+      <td><strong>Abortability</strong> — writes discarded on fault mid-transaction; retry is safe</td>
+      <td>Not concurrency control. Not "all-or-nothing" across distributed services (that's 2PC/Saga territory)</td>
+    </tr>
+    <tr>
+      <td><strong>C — Consistency</strong></td>
+      <td>Application-defined invariants (e.g. "account balance ≥ 0")</td>
+      <td><strong>A property of the app, not the DB.</strong> "The C doesn't really belong in ACID."</td>
+    </tr>
+    <tr>
+      <td><strong>I — Isolation</strong></td>
+      <td>Formally <strong>serializability</strong>; in practice usually much weaker</td>
+      <td>Not what vendor names imply — Oracle "serializable" = snapshot isolation; PG/MySQL "repeatable read" = snapshot isolation</td>
+    </tr>
+    <tr>
+      <td><strong>D — Durability</strong></td>
+      <td>Committed data survives crashes (WAL, fsync, replication)</td>
+      <td>None absolute — SSDs can violate fsync under power loss; async replication can lose confirmed writes (Ch 5)</td>
+    </tr>
+  </table>
+
+  <div class="callout warning">
+    <strong>Failure mode:</strong> assuming the "I" means serializable. Real Bitcoin-exchange losses happened on "ACID" databases at weak isolation. Read the actual isolation level, not the branding.
+  </div>
+
+  <div class="callout realworld">
+    <strong>Real systems:</strong> PostgreSQL (MVCC + SSI option), MySQL/InnoDB (MVCC, weak lost-update detection), Oracle ("serializable" = snapshot isolation), DB2 ("repeatable read" = actual serializability), FoundationDB (distributed SSI), VoltDB/H-Store (serial execution).
+  </div>
+</section>
+
+<!-- ═══ 3. ISOLATION LADDER ═══ -->
+<section id="isolation-ladder">
+  <h2>3. The Isolation Level Ladder</h2>
+  <p><strong>read committed → snapshot isolation → serializable.</strong> Each level rules out specific races at increasing cost (locks, version bookkeeping, aborts).</p>
+
+  <table>
+    <tr><th>Level</th><th>Mechanism</th><th>Cost</th><th>Failure mode</th></tr>
+    <tr>
+      <td><strong>Read committed</strong></td>
+      <td>Readers see only committed values; row-level write locks prevent dirty writes</td>
+      <td>Low — minimal locking</td>
+      <td>Read skew, lost updates, write skew, phantoms all still possible</td>
+    </tr>
+    <tr>
+      <td><strong>Snapshot isolation</strong></td>
+      <td>MVCC — each transaction reads from a consistent snapshot</td>
+      <td>Moderate — version storage, visibility rules</td>
+      <td>Write skew and phantoms still possible; lost-update detection DB-dependent</td>
+    </tr>
+    <tr>
+      <td><strong>Serializable</strong></td>
+      <td>2PL, serial execution, or SSI — transactions behave as if run one-at-a-time</td>
+      <td>High — blocking, aborts, or single-threaded throughput cap</td>
+      <td>Deadlocks (2PL), abort storms (SSI), single-core cap (serial execution)</td>
+    </tr>
+  </table>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 620 380" xmlns="http://www.w3.org/2000/svg" font-family="Inter, sans-serif">
+      <text x="310" y="22" text-anchor="middle" font-weight="700" font-size="14">Isolation Level Ladder</text>
+      <!-- Ladder rungs -->
+      <rect x="80" y="300" width="460" height="55" rx="8" fill="#d1fae5" stroke="#059669"/>
+      <text x="310" y="325" text-anchor="middle" font-weight="700" font-size="13" fill="#047857">Read Committed</text>
+      <text x="310" y="345" text-anchor="middle" font-size="10" fill="#047857">✓ dirty read · ✓ dirty write</text>
+      <rect x="110" y="220" width="400" height="55" rx="8" fill="#dbeafe" stroke="#2563eb"/>
+      <text x="310" y="245" text-anchor="middle" font-weight="700" font-size="13" fill="#1d4ed8">Snapshot Isolation (MVCC)</text>
+      <text x="310" y="265" text-anchor="middle" font-size="10" fill="#1d4ed8">+ read skew · ± lost update (DB-dependent)</text>
+      <rect x="140" y="140" width="340" height="55" rx="8" fill="#ede9fe" stroke="#7c3aed"/>
+      <text x="310" y="165" text-anchor="middle" font-weight="700" font-size="13" fill="#6d28d9">Serializable</text>
+      <text x="310" y="185" text-anchor="middle" font-size="10" fill="#6d28d9">+ write skew · + phantoms · full serial order</text>
+      <!-- Arrow up -->
+      <line x1="60" y1="330" x2="60" y2="160" stroke="#64748b" stroke-width="2" marker-end="url(#up)"/>
+      <text x="45" y="250" text-anchor="middle" font-size="10" fill="#64748b" transform="rotate(-90 45 250)">stronger ↑</text>
+      <!-- Anomaly labels on right -->
+      <text x="520" y="330" font-size="9" fill="#dc2626">dirty read ✗</text>
+      <text x="520" y="345" font-size="9" fill="#dc2626">dirty write ✗</text>
+      <text x="520" y="250" font-size="9" fill="#dc2626">read skew ✗</text>
+      <text x="520" y="265" font-size="9" fill="#d97706">lost update ~</text>
+      <text x="520" y="170" font-size="9" fill="#dc2626">write skew ✗</text>
+      <text x="520" y="185" font-size="9" fill="#dc2626">phantom ✗</text>
+      <!-- Vendor name warning -->
+      <rect x="80" y="55" width="460" height="65" rx="8" fill="#fef3c7" stroke="#d97706"/>
+      <text x="310" y="78" text-anchor="middle" font-weight="700" font-size="11" fill="#92400e">⚠ Vendor names lie</text>
+      <text x="310" y="96" text-anchor="middle" font-size="9" fill="#92400e">PG/MySQL "repeatable read" = snapshot isolation · Oracle "serializable" = snapshot isolation</text>
+      <text x="310" y="110" text-anchor="middle" font-size="9" fill="#92400e">DB2 "repeatable read" = serializable · "Nobody really knows what repeatable read means"</text>
+      <defs><marker id="up" markerWidth="8" markerHeight="8" refX="4" refY="6" orient="auto"><path d="M0,8 L4,0 L8,8 z" fill="#64748b"/></marker></defs>
+    </svg>
+    <figcaption>Figure 3.1 — Isolation ladder: each rung adds protection at increasing cost. ~ = DB-dependent.</figcaption>
+  </figure>
+</section>
+
+<!-- ═══ 4. ANOMALIES ═══ -->
+<section id="anomalies">
+  <h2>4. Anomaly-to-Level Mapping</h2>
+  <p><strong>Interview gold:</strong> for each anomaly, know the weakest isolation level that prevents it.</p>
+
+  <table>
+    <tr><th>Anomaly</th><th>What happens</th><th>Weakest level that prevents it</th><th>Fixes / notes</th></tr>
+    <tr>
+      <td><strong>Dirty read</strong></td>
+      <td>See uncommitted writes from another transaction</td>
+      <td><strong>Read committed</strong></td>
+      <td>Readers get old committed value while write is in flight</td>
+    </tr>
+    <tr>
+      <td><strong>Dirty write</strong></td>
+      <td>Overwrite uncommitted writes (Alice/Bob car sale: Bob wins listing, Alice gets invoice)</td>
+      <td><strong>Read committed</strong> (nearly all implementations)</td>
+      <td>Row-level write locks held until commit</td>
+    </tr>
+    <tr>
+      <td><strong>Read skew</strong><br><em>(non-repeatable read)</em></td>
+      <td>See DB at different points in time (Alice sees $500 + $400 = $900 mid-transfer)</td>
+      <td><strong>Snapshot isolation</strong></td>
+      <td>Bites hardest in backups and long analytic/integrity queries</td>
+    </tr>
+    <tr>
+      <td><strong>Lost update</strong></td>
+      <td>Concurrent read-modify-write; later write clobbers earlier (counter 42→43, not 44)</td>
+      <td><strong>Snapshot isolation</strong> (DB-dependent) or explicit locks</td>
+      <td>Atomic ops (<code>SET value = value + 1</code>), <code>SELECT ... FOR UPDATE</code>, compare-and-set. <strong>PostgreSQL repeatable read aborts; MySQL/InnoDB does not.</strong> Locks/CAS useless under multi-leader/leaderless (Ch 5)</td>
+    </tr>
+    <tr>
+      <td><strong>Write skew</strong></td>
+      <td>Two txs read same objects, update <em>different</em> objects, each invalidating the other's premise</td>
+      <td><strong>Serializable</strong></td>
+      <td>Generalization of lost update. Not caught by snapshot isolation. <code>FOR UPDATE</code> on rows the decision depends on works when rows exist</td>
+    </tr>
+    <tr>
+      <td><strong>Phantom</strong></td>
+      <td>Write changes result of another transaction's search query — worst on <em>absence</em> checks (room free, username untaken)</td>
+      <td><strong>Serializable</strong></td>
+      <td><code>FOR UPDATE</code> has nothing to lock. Needs predicate/index-range locks or serializability. Last resort: <strong>materializing conflicts</strong> (pre-created lock rows, e.g. room×timeslot table)</td>
+    </tr>
+  </table>
+
+  <div class="callout analogy">
+    <strong>Write skew vs phantom:</strong> write skew = read → decide → write across <em>existing</em> rows (doctors on call). Phantom = same pattern but the check is for <em>absence</em> (no row to lock). <code>FOR UPDATE</code> fixes the former, not the latter.
+  </div>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 620 200" xmlns="http://www.w3.org/2000/svg" font-family="Inter, sans-serif">
+      <text x="310" y="20" text-anchor="middle" font-weight="700" font-size="12">Read skew: Alice sees inconsistent snapshot mid-transfer</text>
+      <rect x="40" y="40" width="250" height="130" rx="6" fill="#f0f9ff" stroke="#2563eb"/>
+      <text x="165" y="62" text-anchor="middle" font-weight="600" font-size="11">Account A: $500</text>
+      <text x="165" y="82" text-anchor="middle" font-size="10" fill="#64748b">(before transfer)</text>
+      <line x1="60" y1="95" x2="270" y2="95" stroke="#cbd5e1" stroke-width="1"/>
+      <text x="165" y="115" text-anchor="middle" font-weight="600" font-size="11">Account B: $400</text>
+      <text x="165" y="135" text-anchor="middle" font-size="10" fill="#64748b">(after $100 moved — Alice read A then B)</text>
+      <text x="165" y="158" text-anchor="middle" font-size="11" fill="#dc2626" font-weight="600">Sum = $900 ≠ $1000 total</text>
+      <rect x="330" y="40" width="250" height="130" rx="6" fill="#d1fae5" stroke="#059669"/>
+      <text x="455" y="62" text-anchor="middle" font-weight="600" font-size="11">Snapshot isolation fix</text>
+      <text x="455" y="85" text-anchor="middle" font-size="10">Both reads from same snapshot</text>
+      <text x="455" y="105" text-anchor="middle" font-size="10">A: $500 + B: $300 = $800</text>
+      <text x="455" y="125" text-anchor="middle" font-size="10">OR A: $400 + B: $400 = $800</text>
+      <text x="455" y="155" text-anchor="middle" font-size="10" fill="#047857" font-weight="600">Consistent point-in-time view</text>
+    </svg>
+    <figcaption>Figure 4.1 — Read skew under read committed; snapshot isolation gives a consistent view.</figcaption>
+  </figure>
+</section>
+
+<!-- ═══ 5. MVCC ═══ -->
+<section id="mvcc">
+  <h2>5. MVCC — Snapshot Isolation Implementation</h2>
+  <p><strong>Multi-Version Concurrency Control</strong> — how snapshot isolation is built in PostgreSQL, MySQL/InnoDB, Oracle, SQL Server, and others.</p>
+
+  <table>
+    <tr><th>When</th><td>Default or "repeatable read" in most OLTP databases — the workhorse isolation level.</td></tr>
+    <tr><th>How</th><td>Rows versioned with <code>created_by</code> / <code>deleted_by</code> transaction IDs. Update = delete old version + create new. Visibility rules hide in-progress and later-started transactions' writes.</td></tr>
+    <tr><th>Why it works</th><td>Each reader sees a frozen snapshot; writers create new versions without blocking readers.</td></tr>
+    <tr><th>Failure mode</th><td>Write skew and phantoms slip through — readers and writers don't conflict on different rows.</td></tr>
+  </table>
+
+  <div class="callout key">
+    <strong>Mantra: readers never block writers, writers never block readers.</strong> The opposite of 2PL. Storage cost: old versions must be garbage-collected (vacuum in PostgreSQL).
+  </div>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 620 180" xmlns="http://www.w3.org/2000/svg" font-family="Inter, sans-serif">
+      <text x="310" y="20" text-anchor="middle" font-weight="700" font-size="12">MVCC: update = delete + create</text>
+      <rect x="40" y="40" width="160" height="45" rx="5" fill="#64748b" opacity="0.5"/><text x="120" y="58" text-anchor="middle" fill="white" font-size="10">v1: balance=500</text><text x="120" y="75" text-anchor="middle" fill="#cbd5e1" font-size="9">deleted_by: tx42</text>
+      <rect x="230" y="40" width="160" height="45" rx="5" fill="#2563eb"/><text x="310" y="58" text-anchor="middle" fill="white" font-size="10">v2: balance=400</text><text x="310" y="75" text-anchor="middle" fill="#bfdbfe" font-size="9">created_by: tx42</text>
+      <text x="420" y="65" font-size="10" fill="#64748b">Tx 41 (started before 42)</text>
+      <text x="420" y="80" font-size="10" fill="#64748b">→ still sees v1 (500)</text>
+      <rect x="40" y="110" width="540" height="55" rx="6" fill="#f0f9ff" stroke="#2563eb"/>
+      <text x="310" y="132" text-anchor="middle" font-size="10">Visibility: hide uncommitted writes · hide writes from txs that started after reader</text>
+      <text x="310" y="152" text-anchor="middle" font-size="10" fill="#2563eb" font-weight="600">Reader sees consistent snapshot without acquiring read locks</text>
+    </svg>
+    <figcaption>Figure 5.1 — MVCC row versioning and visibility rules.</figcaption>
+  </figure>
+
+  <div class="callout realworld">
+    <strong>Alternatives (Ch 3):</strong> append-only B-trees (CouchDB, Datomic, LMDB) achieve similar copy-on-write semantics without traditional MVCC tuple headers.
+  </div>
+</section>
+
+<!-- ═══ 6. 2PL ═══ -->
+<section id="2pl">
+  <h2>6. Two-Phase Locking (2PL)</h2>
+  <p>The classic pessimistic path to serializability. <strong>2PL ≠ 2PC</strong> (two-phase commit is distributed atomicity, Ch 8–9).</p>
+
+  <table>
+    <tr><th>When</th><td>Need serializability with general-purpose SQL; acceptable blocking and deadlock risk.</td></tr>
+    <tr><th>How</th><td><strong>Shared locks</strong> to read, <strong>exclusive locks</strong> to write — all held until commit. Acquire phase → release phase (no lock released early).</td></tr>
+    <tr><th>Why it works</th><td>Conflicting operations serialize on locks → equivalent to some serial order.</td></tr>
+    <tr><th>Failure mode</th><td>Readers block writers and vice versa — opposite of MVCC. Unstable tail latency. Deadlocks (auto-detected, one victim aborted).</td></tr>
+  </table>
+
+  <h3>Predicate locks &amp; phantoms</h3>
+  <p><strong>Predicate locks</strong> cover all objects matching a condition, including rows that don't exist yet — kills phantoms but slow. Real systems use <strong>index-range (next-key) locks</strong> — a coarser safe approximation on index entries.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 620 200" xmlns="http://www.w3.org/2000/svg" font-family="Inter, sans-serif">
+      <text x="310" y="20" text-anchor="middle" font-weight="700" font-size="12">2PL: readers and writers block each other</text>
+      <rect x="80" y="45" width="200" height="50" rx="6" fill="#dbeafe" stroke="#2563eb"/>
+      <text x="180" y="68" text-anchor="middle" font-weight="600" font-size="11">Reader (shared lock)</text>
+      <text x="180" y="85" text-anchor="middle" font-size="9" fill="#64748b">blocks writer on same row</text>
+      <rect x="340" y="45" width="200" height="50" rx="6" fill="#fee2e2" stroke="#dc2626"/>
+      <text x="440" y="68" text-anchor="middle" font-weight="600" font-size="11">Writer (exclusive lock)</text>
+      <text x="440" y="85" text-anchor="middle" font-size="9" fill="#64748b">blocks all readers on row</text>
+      <line x1="280" y1="70" x2="340" y2="70" stroke="#dc2626" stroke-width="2"/>
+      <text x="310" y="62" text-anchor="middle" font-size="14">✕</text>
+      <rect x="80" y="120" width="460" height="65" rx="6" fill="#fef3c7" stroke="#d97706"/>
+      <text x="310" y="145" text-anchor="middle" font-size="10" font-weight="600">Predicate / index-range lock on shift_id=1234</text>
+      <text x="310" y="165" text-anchor="middle" font-size="10">Covers rows that don't exist yet → prevents phantom inserts</text>
+    </svg>
+    <figcaption>Figure 6.1 — 2PL blocking vs MVCC; index-range locks approximate predicate locks.</figcaption>
+  </figure>
+
+  <div class="callout warning">
+    <strong>Materializing conflicts (last resort):</strong> pre-create lock rows (room×timeslot table) so <code>FOR UPDATE</code> has something to grab. Ugly — concurrency control leaking into the data model.
+  </div>
+</section>
+
+<!-- ═══ 7. SERIAL EXECUTION ═══ -->
+<section id="serial-execution">
+  <h2>7. Actual Serial Execution</h2>
+  <p>Serializable by construction: <strong>one transaction at a time</strong> on one thread. VoltDB/H-Store, Redis (single-threaded), Datomic.</p>
+
+  <table>
+    <tr><th>When</th><td>Short OLTP transactions, data fits in RAM, throughput capped at one core per partition.</td></tr>
+    <tr><th>How</th><td>Remove all concurrency — no locks, no MVCC, no conflict detection needed.</td></tr>
+    <tr><th>Why it works</th><td>Literally serial → trivially serializable. Viable since ~2007: cheap RAM + fast CPUs.</td></tr>
+    <tr><th>Failure mode</th><td>Requires stored procedures (no interactive round-trips). Cross-partition transactions orders of magnitude slower (Ch 6).</td></tr>
+  </table>
+
+  <div class="callout analogy">
+    <strong>Pessimism to the extreme:</strong> serial execution is an exclusive lock on the entire database. Low contention paradise; high contention or long transactions → throughput collapse.
+  </div>
+</section>
+
+<!-- ═══ 8. SSI ═══ -->
+<section id="ssi">
+  <h2>8. Serializable Snapshot Isolation (SSI)</h2>
+  <p><strong>Optimistic</strong> serializability: run on a snapshot, detect serialization conflicts at commit, abort losers. PostgreSQL serializable ≥9.1; FoundationDB distributes it.</p>
+
+  <table>
+    <tr><th>When</th><td>Mostly low-contention OLTP wanting near-snapshot-isolation performance with serializable guarantees.</td></tr>
+    <tr><th>How</th><td>Detect (a) <strong>stale MVCC reads</strong> — an ignored write later committed; (b) <strong>writes affecting prior reads</strong> — index-range "tripwires" that notify, not block.</td></tr>
+    <tr><th>Why it works</th><td>Proceed optimistically; only abort when commit would violate serial order.</td></tr>
+    <tr><th>Failure mode</th><td>High contention → <strong>abort storms</strong>. Long read-write transactions increase conflict window. Must retry aborts.</td></tr>
+  </table>
+
+  <div class="card-grid">
+    <div class="card"><h4>vs 2PL</h4><p>SSI: proceed, abort on conflict. 2PL: block until safe. Low contention → SSI wins.</p></div>
+    <div class="card"><h4>vs serial execution</h4><p>SSI allows concurrency; serial execution forbids it entirely.</p></div>
+    <div class="card"><h4>Retry required</h4><p>Aborts exist to enable retry — but dedupe (lost commit ack), backoff, transient-only, mind side effects (emails).</p></div>
+  </div>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 620 180" xmlns="http://www.w3.org/2000/svg" font-family="Inter, sans-serif">
+      <text x="310" y="20" text-anchor="middle" font-weight="700" font-size="12">SSI conflict detection at commit</text>
+      <rect x="40" y="40" width="250" height="55" rx="6" fill="#dbeafe" stroke="#2563eb"/>
+      <text x="165" y="62" text-anchor="middle" font-weight="600" font-size="10">(a) Stale read detected</text>
+      <text x="165" y="80" text-anchor="middle" font-size="9" fill="#64748b">Tx read snapshot; another tx committed write tx ignored</text>
+      <rect x="330" y="40" width="250" height="55" rx="6" fill="#ede9fe" stroke="#7c3aed"/>
+      <text x="455" y="62" text-anchor="middle" font-weight="600" font-size="10">(b) Read-write conflict</text>
+      <text x="455" y="80" text-anchor="middle" font-size="9" fill="#64748b">Write trips index-range record of prior read → abort loser</text>
+      <rect x="40" y="115" width="540" height="50" rx="6" fill="#d1fae5" stroke="#059669"/>
+      <text x="310" y="138" text-anchor="middle" font-size="10">Near snapshot-isolation performance · degrades under high contention</text>
+      <text x="310" y="155" text-anchor="middle" font-size="10" fill="#047857" font-weight="600">First commit wins; second aborts and retries seeing updated state</text>
+    </svg>
+    <figcaption>Figure 8.1 — SSI detects conflicts at commit time instead of blocking during execution.</figcaption>
+  </figure>
+</section>
+
+<!-- ═══ 9. MENTAL MODELS ═══ -->
+<section id="mental-models">
+  <h2>9. Mental Models</h2>
+
+  <div class="card-grid">
+    <div class="card">
+      <h4>1. Weak isolation is a contract</h4>
+      <p>The DB handles some races, you handle the rest — know exactly which anomalies you've signed up to prevent yourself.</p>
+    </div>
+    <div class="card">
+      <h4>2. Decisions on an outdated premise</h4>
+      <p>Write skew/phantoms = read → decide → write. The premise ("2 doctors on call") can be stale at commit. The DB can't know how you used a query result — only serializability protects the premise.</p>
+    </div>
+    <div class="card">
+      <h4>3. Pessimistic vs optimistic</h4>
+      <p>2PL and serial execution wait (serial execution = exclusive lock on whole DB). SSI proceeds and aborts on conflict. Low contention → optimistic; high contention → pessimistic or commutative atomic ops.</p>
+    </div>
+  </div>
+
+  <div class="callout key">
+    <strong>Three roads to serializability:</strong> serial execution (in-memory, single-core cap), 2PL (general, slow tails, deadlocks), SSI (optimistic, aborts under contention). Pick based on contention profile and latency requirements.
+  </div>
+</section>
+
+<!-- ═══ 10. ANTI-PATTERNS ═══ -->
+<section id="anti-patterns">
+  <h2>10. Anti-Patterns</h2>
+  <table>
+    <tr><th>Anti-pattern</th><th>Why it fails</th></tr>
+    <tr><td>Trusting "ACID" branding</td><td>Real Bitcoin-exchange losses on "ACID" databases at weak isolation</td></tr>
+    <tr><td>Read-modify-write in app code (ORM habit)</td><td>Silent lost updates — use atomic DB ops (<code>UPDATE SET x = x + 1</code>)</td></tr>
+    <tr><td>Check-then-act on absence under snapshot isolation</td><td>Phantom write skew — bookings, usernames, double-spend checks</td></tr>
+    <tr><td>Calling single-object CAS "lightweight transactions"</td><td>Transactions mean multi-object grouping; CAS is not a transaction</td></tr>
+    <tr><td>Not retrying aborts (ActiveRecord/Django bubble exception)</td><td>Aborts exist to enable retry — but dedupe, backoff, transient-only, mind side effects</td></tr>
+    <tr><td>Assuming vendor isolation names are standard</td><td>PG/MySQL "repeatable read" ≠ DB2 "repeatable read" — read the docs</td></tr>
+    <tr><td>Locks/CAS under multi-leader replication</td><td>Need single up-to-date copy — use commutative ops or sibling merges (Ch 5)</td></tr>
+  </table>
+</section>
+
+<!-- ═══ 11. WORKED EXAMPLE ═══ -->
+<section id="worked-example">
+  <h2>11. Worked Example: Doctors On-Call Write Skew</h2>
+  <p>Shift needs ≥1 doctor on call. Alice and Bob are both on call, both sick, both click "go off call" simultaneously.</p>
+
+  <h3>What each transaction does</h3>
+  <pre>-- Alice's transaction                    -- Bob's transaction
+BEGIN;                                    BEGIN;
+SELECT count(*) FROM doctors              SELECT count(*) FROM doctors
+  WHERE on_call = true                      WHERE on_call = true
+  AND shift_id = 1234;                      AND shift_id = 1234;
+-- sees 2 → passes >= 2 check             -- sees 2 → passes >= 2 check
+
+UPDATE doctors SET on_call = false        UPDATE doctors SET on_call = false
+  WHERE name = 'Alice'                        WHERE name = 'Bob'
+  AND shift_id = 1234;                        AND shift_id = 1234;
+COMMIT;                                   COMMIT;
+-- Both commit → ZERO doctors on call!</pre>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 620 280" xmlns="http://www.w3.org/2000/svg" font-family="Inter, sans-serif">
+      <text x="310" y="18" text-anchor="middle" font-weight="700" font-size="13">Write skew timeline — snapshot isolation misses it</text>
+      <!-- Time axis -->
+      <line x1="60" y1="240" x2="560" y2="240" stroke="#64748b" stroke-width="2"/>
+      <text x="60" y="258" font-size="9" fill="#64748b">t0</text>
+      <text x="200" y="258" font-size="9" fill="#64748b">t1</text>
+      <text x="340" y="258" font-size="9" fill="#64748b">t2</text>
+      <text x="480" y="258" font-size="9" fill="#64748b">t3</text>
+      <!-- Alice -->
+      <text x="30" y="55" font-size="10" font-weight="700" fill="#2563eb">Alice</text>
+      <rect x="60" y="40" width="100" height="28" rx="4" fill="#dbeafe" stroke="#2563eb"/><text x="110" y="58" text-anchor="middle" font-size="9">BEGIN</text>
+      <rect x="170" y="40" width="120" height="28" rx="4" fill="#dbeafe" stroke="#2563eb"/><text x="230" y="58" text-anchor="middle" font-size="9">SELECT count=2 ✓</text>
+      <rect x="300" y="40" width="130" height="28" rx="4" fill="#dbeafe" stroke="#2563eb"/><text x="365" y="58" text-anchor="middle" font-size="9">UPDATE Alice off</text>
+      <rect x="440" y="40" width="80" height="28" rx="4" fill="#059669"/><text x="480" y="58" text-anchor="middle" fill="white" font-size="9">COMMIT</text>
+      <!-- Bob -->
+      <text x="30" y="105" font-size="10" font-weight="700" fill="#7c3aed">Bob</text>
+      <rect x="80" y="90" width="100" height="28" rx="4" fill="#ede9fe" stroke="#7c3aed"/><text x="130" y="108" text-anchor="middle" font-size="9">BEGIN</text>
+      <rect x="190" y="90" width="120" height="28" rx="4" fill="#ede9fe" stroke="#7c3aed"/><text x="250" y="108" text-anchor="middle" font-size="9">SELECT count=2 ✓</text>
+      <rect x="320" y="90" width="120" height="28" rx="4" fill="#ede9fe" stroke="#7c3aed"/><text x="380" y="108" text-anchor="middle" font-size="9">UPDATE Bob off</text>
+      <rect x="450" y="90" width="80" height="28" rx="4" fill="#059669"/><text x="490" y="108" text-anchor="middle" fill="white" font-size="9">COMMIT</text>
+      <!-- Snapshot note -->
+      <rect x="60" y="140" width="500" height="45" rx="6" fill="#fef3c7" stroke="#d97706"/>
+      <text x="310" y="160" text-anchor="middle" font-size="10" font-weight="600" fill="#92400e">Each reads a consistent snapshot where BOTH doctors are on call</text>
+      <text x="310" y="176" text-anchor="middle" font-size="10" fill="#92400e">They update DIFFERENT rows → no dirty write, no lost update, nothing to detect</text>
+      <!-- Result -->
+      <rect x="180" y="200" width="260" height="35" rx="6" fill="#fee2e2" stroke="#dc2626"/>
+      <text x="310" y="222" text-anchor="middle" font-size="11" fill="#dc2626" font-weight="700">Result: 0 doctors on call — invariant violated</text>
+    </svg>
+    <figcaption>Figure 11.1 — Write skew: serially the second transaction would see count=1 and refuse.</figcaption>
+  </figure>
+
+  <h3>Why snapshot isolation misses it</h3>
+  <p>Each transaction reads a consistent snapshot where both doctors are on call, and they update <em>different rows</em> — no dirty write, no lost update, nothing for detection to catch. Serially, the second would have seen count = 1 and refused; the anomaly exists only under concurrency.</p>
+
+  <h3>Fixes</h3>
+  <table>
+    <tr><th>Approach</th><th>How it works here</th></tr>
+    <tr><td><strong>Serializable isolation (SSI)</strong></td><td>Each UPDATE trips index-range record of the other's read on shift 1234; first commits, second aborts and retries seeing count = 1</td></tr>
+    <tr><td><strong>2PL</strong></td><td>Second SELECT blocks until first commits; then sees count = 1</td></tr>
+    <tr><td><strong>SELECT ... FOR UPDATE</strong></td><td>Works <em>here</em> because on-call rows exist to lock — unlike phantom variants</td></tr>
+    <tr><td><strong>DB constraint</strong></td><td>"At least one on call" isn't expressible as a standard constraint — needs app logic or serializability</td></tr>
+  </table>
+
+  <div class="callout key">
+    <strong>That's write skew:</strong> read-decide-write across objects where each transaction's decision is based on a premise that the other transaction invalidates — without touching the same row.
+  </div>
+</section>
+
+<!-- ═══ 12. PROBLEMS SOLVED ═══ -->
+<section id="problems-solved">
+  <h2>12. Problems Each Mechanism Solves</h2>
+  <table>
+    <tr><th>Mechanism</th><th>Problem it solves</th><th>Example</th></tr>
+    <tr><td>Atomic read-modify-write (locks, Lua scripts, sorted sets)</td><td>Race on shared counter under concurrent access</td><td>Rate limiter (Redis counter races)</td></tr>
+    <tr><td>Non-atomic multi-store commit made safe (pending→uploaded flag)</td><td>Multi-store write isn't wrapped in single DB transaction; partial completion must be representable</td><td>Google Drive upload (metadata <code>pending</code>, flipped on S3 callback)</td></tr>
+    <tr><td>Offset + downstream write committed atomically</td><td>At-least-once delivery must not double-count high-value aggregates</td><td>Ad click event aggregation ("a few percent = millions of dollars")</td></tr>
+    <tr><td>Lost-update walkthrough → <code>SELECT FOR UPDATE</code>, optimistic version column, <code>CHECK</code>, idempotency-key unique constraint</td><td>Double-booking / double-submission under concurrent requests</td><td>Hotel reservation system</td></tr>
+    <tr><td>Double-entry ledger on ACID SQL + idempotency-key unique constraint</td><td>Money must never be created or destroyed; retries must not double-move it</td><td>Payment system</td></tr>
+    <tr><td>2PC → TC/C → Saga (distributed-transaction spectrum)</td><td>Atomicity across services when no single DB transaction spans them</td><td>Digital wallet</td></tr>
+    <tr><td>WAL + transactional mapping-table update during compaction</td><td>Merging small objects can't leave object-to-location mapping inconsistent mid-merge</td><td>S3-like object storage (secondary)</td></tr>
+  </table>
+</section>
+
+<!-- ═══ 13. CONNECTS TO ═══ -->
+<section id="connects">
+  <h2>13. Connects To (Cross-Chapter)</h2>
+  <table>
+    <tr><th>Chapter</th><th>Connection</th><th>Interview soundbite</th></tr>
+    <tr><td><strong>Ch 3 Storage</strong></td><td>WAL underpins atomicity/durability; append-only B-trees (CouchDB, Datomic, LMDB) as alternative MVCC</td><td>"Atomicity = WAL + abort; durability = fsync + replication."</td></tr>
+    <tr><td><strong>Ch 5 Replication</strong></td><td>Lost updates across replicas, LWW, siblings/merges; durability via replication; locks/CAS need single up-to-date copy</td><td>"Multi-leader breaks SELECT FOR UPDATE — use commutative ops or merges."</td></tr>
+    <tr><td><strong>Ch 6 Partitioning</strong></td><td>Why serial execution partitions; cross-partition transactions orders of magnitude slower</td><td>"Serializable per partition ≠ global serializability."</td></tr>
+    <tr><td><strong>Ch 8–9 Distributed</strong></td><td>Distributed faults; distributed transactions, 2PC (≠ 2PL), linearizability (CAP's "consistency")</td><td>"2PL is single-node serializability; 2PC is cross-service atomicity."</td></tr>
+  </table>
+</section>
+
+<!-- ═══ 14. TAKEAWAYS ═══ -->
+<section id="takeaways">
+  <h2>14. Key Takeaways</h2>
+  <ol>
+    <li><strong>Atomicity = abortability; Consistency is your job;</strong> "ACID" says almost nothing about actual isolation level.</li>
+    <li><strong>The ladder:</strong> read committed kills dirty reads/writes; snapshot isolation (MVCC) adds read-skew protection; only serializable kills write skew and phantoms (lost updates: sometimes detected at snapshot isolation, DB-dependent).</li>
+    <li><strong>Vendor names lie:</strong> PG/MySQL "repeatable read" and Oracle "serializable" = snapshot isolation; DB2 "repeatable read" = serializable.</li>
+    <li><strong>Write skew = read-decide-write across objects;</strong> phantoms = write skew on absence checks. <code>FOR UPDATE</code> fixes the former, not the latter.</li>
+    <li><strong>Three roads to serializability:</strong> serial execution (in-memory, single-core cap), 2PL (general, slow tails, deadlocks), SSI (optimistic, aborts under contention).</li>
+    <li><strong>Locks/CAS need a single up-to-date copy</strong> — they break under multi-leader/leaderless replication (Ch 5).</li>
+  </ol>
+</section>
+
+<!-- ═══ 15. CHECKPOINTS ═══ -->
+<section id="checkpoints">
+  <h2>15. Junior SWE Checkpoints</h2>
+
+  <div class="quiz">
+    <h4>Q1: What does atomicity actually mean in ACID?</h4>
+    <p><strong>Abortability</strong> — if a fault occurs mid-transaction, all writes are discarded and the app can safely retry. Not concurrency control. Not distributed atomicity (that's 2PC/Saga).</p>
+  </div>
+  <div class="quiz">
+    <h4>Q2: User A and B both read counter=42, both increment, both write 43. Expected 44. What anomaly?</h4>
+    <p><strong>Lost update.</strong> Fix: atomic <code>UPDATE SET x = x + 1</code>, <code>SELECT FOR UPDATE</code>, or optimistic version column. PostgreSQL repeatable read aborts; MySQL/InnoDB does not.</p>
+  </div>
+  <div class="quiz">
+    <h4>Q3: Two doctors go off call simultaneously; zero remain. Why doesn't snapshot isolation catch it?</h4>
+    <p><strong>Write skew.</strong> Each reads a snapshot with count=2, updates different rows. No dirty write, no lost update on same row. Needs serializable isolation or <code>FOR UPDATE</code> on the on-call rows.</p>
+  </div>
+  <div class="quiz">
+    <h4>Q4: Booking system checks "no row for room 42 on Tuesday" then inserts. Two users book simultaneously. What anomaly?</h4>
+    <p><strong>Phantom.</strong> Absence check — <code>FOR UPDATE</code> has nothing to lock. Needs predicate/index-range locks (2PL) or SSI, or materialize conflict rows.</p>
+  </div>
+  <div class="quiz">
+    <h4>Q5: What's the difference between 2PL and 2PC?</h4>
+    <p><strong>2PL</strong> = two-phase <em>locking</em> for single-node serializability (shared/exclusive locks held to commit). <strong>2PC</strong> = two-phase <em>commit</em> for distributed atomicity across services (Ch 8–9). Completely different mechanisms.</p>
+  </div>
+  <div class="quiz">
+    <h4>Q6: When does SSI beat 2PL? When does 2PL beat SSI?</h4>
+    <p><strong>SSI wins</strong> at low contention — near snapshot-isolation performance, abort only on actual conflict. <strong>2PL wins</strong> at high contention — blocks instead of abort storms; or use commutative atomic ops.</p>
+  </div>
+  <div class="quiz">
+    <h4>Q7: Why doesn't "we use PostgreSQL, it's ACID" protect against write skew?</h4>
+    <p>PostgreSQL default is <strong>read committed</strong>; "repeatable read" is snapshot isolation, not serializable. Must explicitly set <code>SERIALIZABLE</code> (SSI) or use <code>FOR UPDATE</code> / app-level constraints.</p>
+  </div>
+
+  <h3>Glossary</h3>
+  <table>
+    <tr><th>Term</th><th>Definition</th></tr>
+    <tr><td>Atomicity</td><td>Abortability — all-or-nothing within one transaction on one node</td></tr>
+    <tr><td>Snapshot isolation</td><td>Each transaction reads from a consistent point-in-time snapshot (MVCC)</td></tr>
+    <tr><td>MVCC</td><td>Multi-version concurrency control — row versions with visibility rules</td></tr>
+    <tr><td>Read skew</td><td>Seeing DB at different points in time within one transaction</td></tr>
+    <tr><td>Lost update</td><td>Concurrent read-modify-write; later write clobbers earlier</td></tr>
+    <tr><td>Write skew</td><td>Transactions read same data, write different rows, invalidate each other's premise</td></tr>
+    <tr><td>Phantom</td><td>Write changes the result set of another transaction's query</td></tr>
+    <tr><td>2PL</td><td>Two-phase locking — shared/exclusive locks held until commit</td></tr>
+    <tr><td>Predicate lock</td><td>Lock on all rows matching a condition, including not-yet-existing rows</td></tr>
+    <tr><td>SSI</td><td>Serializable snapshot isolation — optimistic conflict detection at commit</td></tr>
+    <tr><td>Materializing conflicts</td><td>Pre-creating lock rows so FOR UPDATE can prevent phantoms</td></tr>
+    <tr><td>Serial execution</td><td>One transaction at a time — trivially serializable, single-core cap</td></tr>
+  </table>
+</section>
+
+<footer class="page-footer">
+  DDIA Visual Guide · Chapter 7 · Source: claude-skills/ch07-transactions.md · Next: Ch 8 The Trouble with Distributed Systems
+</footer>
+
+</body>
+</html>

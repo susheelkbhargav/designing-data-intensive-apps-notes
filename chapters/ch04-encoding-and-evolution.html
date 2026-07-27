@@ -1,0 +1,520 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>DDIA Visual Guide — Chapter 4: Encoding and Evolution</title>
+  <link rel="stylesheet" href="../assets/styles.css">
+</head>
+<body>
+
+<header class="cover">
+  <div class="series">Designing Data-Intensive Applications · Visual Companion</div>
+  <h1>Chapter 4<br>Encoding and Evolution</h1>
+  <p class="subtitle">How data formats survive rolling upgrades — backward and forward compatibility</p>
+  <div class="badge">Part I: Foundations · Illustrated · Interview-ready</div>
+  <p class="meta" style="margin-top:2rem;">Martin Kleppmann · Source: claude-skills / ch04-encoding-and-evolution.md</p>
+</header>
+
+<nav class="toc">
+  <h2>Table of Contents</h2>
+  <ol>
+    <li><a href="#core">Core Idea</a></li>
+    <li><a href="#thrift-protobuf">Framework: Thrift / Protocol Buffers</a></li>
+    <li><a href="#avro">Framework: Avro</a></li>
+    <li><a href="#compat">Backward &amp; Forward Compatibility</a></li>
+    <li><a href="#key-concepts">Key Concepts</a></li>
+    <li><a href="#dataflow">Dataflow Modes</a></li>
+    <li><a href="#rpc">RPC Flaws &amp; Modern Alternatives</a></li>
+    <li><a href="#mental-models">Mental Models</a></li>
+    <li><a href="#anti-patterns">Anti-Patterns</a></li>
+    <li><a href="#worked-example">Worked Example: Byte Sizes &amp; Schema Changes</a></li>
+    <li><a href="#problems-solved">Problems This Solves</a></li>
+    <li><a href="#connects">Connects To (Cross-Chapter)</a></li>
+    <li><a href="#takeaways">Key Takeaways</a></li>
+    <li><a href="#checkpoints">Junior SWE Checkpoints</a></li>
+  </ol>
+</nav>
+
+<!-- ═══ 1. CORE IDEA ═══ -->
+<section id="core">
+  <h2>1. Core Idea</h2>
+  <p>Code changes roll out gradually — rolling upgrades server-side, laggard clients elsewhere — so <strong>old and new code, and old and new data formats, coexist</strong> in one running system. Everything hinges on two compatibility properties:</p>
+
+  <div class="card-grid">
+    <div class="card">
+      <h4>Backward compatibility</h4>
+      <p><strong>Newer code reads data written by older code.</strong> Easy — you know the old format.</p>
+    </div>
+    <div class="card">
+      <h4>Forward compatibility</h4>
+      <p><strong>Older code reads data written by newer code.</strong> Harder — old code must ignore additions it doesn't understand.</p>
+    </div>
+  </div>
+
+  <div class="callout key">
+    <strong>Choose an encoding whose schema evolution rules give you both,</strong> and you can deploy any component in any order without downtime.
+  </div>
+</section>
+
+<!-- ═══ 2. THRIFT / PROTOBUF ═══ -->
+<section id="thrift-protobuf">
+  <h2>2. Framework: Thrift / Protocol Buffers</h2>
+  <p>Schema-driven binary encodings with numeric <strong>tag numbers</strong>. Internal service-to-service data (RPC, storage) in statically typed shops; compact encoding plus codegen.</p>
+
+  <table>
+    <tr><th>When</th><td>Internal RPC/storage; statically typed services; you want compact wire format + codegen.</td></tr>
+    <tr><th>How</th><td>Schema (IDL) assigns each field a tag number. Encoded record = concatenation of (tag, type, value) — <strong>no field names on the wire.</strong></td></tr>
+    <tr><th>Why it works</th><td>Tags are stable aliases for names — rename freely, wire never sees names. Old code skips unknown tags (type tells it how many bytes to skip) → forward compatible. New code still understands old tags → backward compatible.</td></tr>
+    <tr><th>Failure mode</th><td>Reuse or change a tag number → all existing data silently misinterpreted. Add a <code>required</code> field after v1 → new code fails reading old data. Removed tags are burned forever.</td></tr>
+  </table>
+
+  <pre>required string userName = 1;
+optional int64 favorite_number = 2;
+repeated string interests = 3;</pre>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 620 220" xmlns="http://www.w3.org/2000/svg" font-family="Inter, sans-serif">
+      <text x="310" y="22" text-anchor="middle" font-weight="700" font-size="13">Protobuf on the wire — tags, not names</text>
+      <rect x="40" y="45" width="90" height="50" rx="6" fill="#2563eb"/><text x="85" y="68" text-anchor="middle" fill="white" font-size="10" font-weight="600">tag 1</text><text x="85" y="82" text-anchor="middle" fill="#bfdbfe" font-size="9">string</text>
+      <rect x="145" y="45" width="90" height="50" rx="6" fill="#2563eb"/><text x="190" y="68" text-anchor="middle" fill="white" font-size="10" font-weight="600">tag 2</text><text x="190" y="82" text-anchor="middle" fill="#bfdbfe" font-size="9">int64</text>
+      <rect x="250" y="45" width="90" height="50" rx="6" fill="#2563eb"/><text x="295" y="68" text-anchor="middle" fill="white" font-size="10" font-weight="600">tag 3</text><text x="295" y="82" text-anchor="middle" fill="#bfdbfe" font-size="9">list</text>
+      <text x="370" y="75" font-size="11" fill="#64748b">→</text>
+      <rect x="390" y="40" width="190" height="60" rx="6" fill="#f3f4f6" stroke="#64748b"/>
+      <text x="485" y="62" text-anchor="middle" font-size="9" font-family="JetBrains Mono, monospace">"Martin" · 1337 · ["daydreaming","hacking"]</text>
+      <text x="485" y="82" text-anchor="middle" font-size="9" fill="#64748b">values only — names live in schema</text>
+      <rect x="40" y="120" width="540" height="85" rx="8" fill="#fef3c7" stroke="#d97706"/>
+      <text x="310" y="145" text-anchor="middle" font-weight="700" font-size="11" fill="#92400e">Old reader sees tag 4 (photoURL) → skip bytes using type annotation</text>
+      <text x="310" y="165" text-anchor="middle" font-size="10" fill="#78350f">Rename userName → displayName in schema: wire unchanged (tag 1 still tag 1)</text>
+      <text x="310" y="185" text-anchor="middle" font-size="10" fill="#dc2626" font-weight="600">Never reuse tag numbers — silent corruption</text>
+    </svg>
+    <figcaption>Figure 2.1 — Tag-based encoding: forward compat by skipping unknown tags; backward compat by reading known tags.</figcaption>
+  </figure>
+
+  <div class="callout realworld">
+    <strong>Real systems:</strong> gRPC on Protobuf (Google, most microservices), Apache Thrift (Facebook origin), Finagle/Thrift stacks, Rest.li with Protobuf payloads.
+  </div>
+</section>
+
+<!-- ═══ 3. AVRO ═══ -->
+<section id="avro">
+  <h2>3. Framework: Avro</h2>
+  <p>Schema-driven binary encoding with <strong>no tags</strong> — just values concatenated. Most compact of all for the same record.</p>
+
+  <table>
+    <tr><th>When</th><td>Hadoop-style big files of records; dynamically generated schemas (e.g., dumping a relational DB — column names become field names automatically).</td></tr>
+    <tr><th>How</th><td>Decoder resolves <strong>writer's schema</strong> (what encoder used) against <strong>reader's schema</strong> (what decoder expects). They need only be <em>compatible</em>, not identical: fields matched by name, extra writer fields ignored, missing ones filled from reader's default.</td></tr>
+    <tr><th>Why it works</th><td>No tag bookkeeping — friction-free for program-generated schemas. Same Person record: <strong>32 bytes</strong> (vs 33 Protobuf, 59 Thrift Binary, 34 Thrift Compact).</td></tr>
+    <tr><th>Failure mode</th><td>Reader must obtain writer's schema somehow — object container file header, schema registry (Espresso), or connection negotiation (Avro RPC). Lose that and bytes are unreadable. Fields without defaults break compatibility on add (backward) or remove (forward).</td></tr>
+  </table>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 620 240" xmlns="http://www.w3.org/2000/svg" font-family="Inter, sans-serif">
+      <text x="310" y="22" text-anchor="middle" font-weight="700" font-size="13">Avro schema resolution — writer vs reader</text>
+      <rect x="30" y="40" width="250" height="90" rx="8" fill="#dbeafe" stroke="#2563eb"/>
+      <text x="155" y="62" text-anchor="middle" font-weight="700" font-size="11" fill="#2563eb">Writer schema (v1)</text>
+      <text x="155" y="82" text-anchor="middle" font-size="9">userName, favoriteNumber, interests</text>
+      <text x="155" y="98" text-anchor="middle" font-size="9" font-family="JetBrains Mono, monospace">wire: "Martin" · 1337 · [...]</text>
+      <text x="155" y="118" text-anchor="middle" font-size="9" fill="#64748b">32 bytes — no tags, no names</text>
+      <rect x="340" y="40" width="250" height="90" rx="8" fill="#ede9fe" stroke="#7c3aed"/>
+      <text x="465" y="62" text-anchor="middle" font-weight="700" font-size="11" fill="#7c3aed">Reader schema (v2)</text>
+      <text x="465" y="82" text-anchor="middle" font-size="9">+ photoURL default ""</text>
+      <text x="465" y="98" text-anchor="middle" font-size="9">Match by field name</text>
+      <text x="465" y="118" text-anchor="middle" font-size="9" fill="#64748b">Missing photoURL → fill default</text>
+      <line x1="280" y1="85" x2="340" y2="85" stroke="#059669" stroke-width="2" marker-end="url(#ag)"/>
+      <text x="310" y="78" text-anchor="middle" font-size="9" fill="#059669" font-weight="600">resolve</text>
+      <rect x="80" y="155" width="460" height="70" rx="8" fill="#d1fae5" stroke="#059669"/>
+      <text x="310" y="180" text-anchor="middle" font-size="10" font-weight="600" fill="#047857">Schema delivery: file header · schema registry · RPC handshake</text>
+      <text x="310" y="200" text-anchor="middle" font-size="9" fill="#065f46">Without writer schema, concatenated bytes are meaningless</text>
+      <defs><marker id="ag" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L0,6 L8,3 z" fill="#059669"/></marker></defs>
+    </svg>
+    <figcaption>Figure 3.1 — Avro matches fields by name; reader fills defaults for fields absent in writer schema.</figcaption>
+  </figure>
+
+  <div class="callout key">
+    <strong>Tags vs names is the Protobuf/Avro fork.</strong> Tags = wire stability with manual bookkeeping. Name-matching = friction-free dynamically generated schemas. Pick by whether a human or a program authors your schemas.
+  </div>
+</section>
+
+<!-- ═══ 4. COMPATIBILITY ═══ -->
+<section id="compat">
+  <h2>4. Backward &amp; Forward Compatibility</h2>
+
+  <table>
+    <tr><th>Change</th><th>Protobuf / Thrift</th><th>Avro</th><th>JSON</th></tr>
+    <tr>
+      <td><strong>Add field</strong></td>
+      <td>New tag, must be optional/defaulted. Old readers skip tag (forward ✓). New readers tolerate absence (backward ✓).</td>
+      <td>Add with default value. Old readers ignore; new readers fill default on old data.</td>
+      <td>Just works if readers ignore extras — but nothing enforces it.</td>
+    </tr>
+    <tr>
+      <td><strong>Remove field</strong></td>
+      <td>Only if optional; never reuse the tag.</td>
+      <td>Only if field had a default — else forward compat breaks.</td>
+      <td>Readers may break on missing fields.</td>
+    </tr>
+    <tr>
+      <td><strong>Rename field</strong></td>
+      <td>Free — names aren't on the wire.</td>
+      <td>Reader-schema aliases: backward but not forward compatible.</td>
+      <td>Breaks unless both sides agree.</td>
+    </tr>
+    <tr>
+      <td><strong>Change datatype</strong></td>
+      <td>Risky — int32→int64 truncates when old code reads new data. <code>repeated</code> trick for optional scalar→list.</td>
+      <td>Resolution rules per Avro spec.</td>
+      <td>Number ambiguity (int vs float, JS 2^53 limit).</td>
+    </tr>
+  </table>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 620 200" xmlns="http://www.w3.org/2000/svg" font-family="Inter, sans-serif">
+      <text x="310" y="22" text-anchor="middle" font-weight="700" font-size="13">Rolling upgrade — both compat directions needed</text>
+      <rect x="30" y="40" width="120" height="45" rx="6" fill="#64748b"/><text x="90" y="67" text-anchor="middle" fill="white" font-size="11">Old writer</text>
+      <rect x="170" y="40" width="120" height="45" rx="6" fill="#2563eb"/><text x="230" y="67" text-anchor="middle" fill="white" font-size="11">New writer</text>
+      <rect x="310" y="40" width="120" height="45" rx="6" fill="#64748b"/><text x="370" y="67" text-anchor="middle" fill="white" font-size="11">Old reader</text>
+      <rect x="450" y="40" width="120" height="45" rx="6" fill="#2563eb"/><text x="510" y="67" text-anchor="middle" fill="white" font-size="11">New reader</text>
+      <line x1="90" y1="85" x2="510" y2="115" stroke="#059669" stroke-width="1.5" stroke-dasharray="4,3"/>
+      <line x1="230" y1="85" x2="370" y2="115" stroke="#7c3aed" stroke-width="1.5" stroke-dasharray="4,3"/>
+      <rect x="30" y="125" width="260" height="55" rx="6" fill="#d1fae5" stroke="#059669"/>
+      <text x="160" y="148" text-anchor="middle" font-size="10" font-weight="600" fill="#047857">Backward: new reads old</text>
+      <text x="160" y="165" text-anchor="middle" font-size="9" fill="#065f46">New reader ← Old writer data</text>
+      <rect x="330" y="125" width="260" height="55" rx="6" fill="#ede9fe" stroke="#7c3aed"/>
+      <text x="460" y="148" text-anchor="middle" font-size="10" font-weight="600" fill="#6d28d9">Forward: old reads new</text>
+      <text x="460" y="165" text-anchor="middle" font-size="9" fill="#5b21b6">Old reader ← New writer data</text>
+    </svg>
+    <figcaption>Figure 4.1 — During rolling deploy, all four writer/reader combinations can occur simultaneously.</figcaption>
+  </figure>
+
+  <div class="callout pitfall">
+    <strong>Decode → model object → re-encode drops unknown fields (Figure 4-7).</strong> Old code reads a record, updates it, writes it back — silently deleting fields newer code wrote. Preserve unknown fields at the application level. Same trap when a consumer re-publishes messages.
+  </div>
+</section>
+
+<!-- ═══ 5. KEY CONCEPTS ═══ -->
+<section id="key-concepts">
+  <h2>5. Key Concepts</h2>
+
+  <h3>Encoding formats compared</h3>
+  <table>
+    <tr><th>Format</th><th>Pros</th><th>Cons</th></tr>
+    <tr>
+      <td><strong>Language-built-in</strong> (Java Serializable, pickle)</td>
+      <td>Convenient</td>
+      <td>Language-locked, security hole (RCE on decode), versioning-hostile, inefficient. Transient use only.</td>
+    </tr>
+    <tr>
+      <td><strong>JSON / XML / CSV</strong></td>
+      <td>Cross-org interchange, human-readable</td>
+      <td>Number ambiguity, no binary strings (Base64), optional schemas. Twitter ships 64-bit IDs as strings (JS float corrupts &gt; 2^53).</td>
+    </tr>
+    <tr>
+      <td><strong>Binary JSON</strong> (MessagePack)</td>
+      <td>Modest savings (81→66 bytes)</td>
+      <td>Field names still ride along — schema-driven formats win by omitting names.</td>
+    </tr>
+    <tr>
+      <td><strong>Thrift / Protobuf / Avro</strong></td>
+      <td>Compact, schema-as-docs, pre-deploy compat checks, codegen</td>
+      <td>Schema management overhead; Avro needs schema delivery channel.</td>
+    </tr>
+  </table>
+
+  <div class="callout analogy">
+    <strong>Schema evolution = schema-on-read flexibility with schema-on-write guarantees.</strong> Databases fake single-schema appearance — add nullable column, fill nulls on read — while old rows keep their original encoding forever.
+  </div>
+
+  <h3>Merits of schemas</h3>
+  <ul>
+    <li><strong>Compactness</strong> — omit field names from every record.</li>
+    <li><strong>Documentation</strong> — schema is guaranteed-current contract.</li>
+    <li><strong>Compatibility checks</strong> — verify forward/backward before deploying.</li>
+    <li><strong>Codegen</strong> — static typing from IDL.</li>
+  </ul>
+</section>
+
+<!-- ═══ 6. DATAFLOW MODES ═══ -->
+<section id="dataflow">
+  <h2>6. Dataflow Modes</h2>
+  <p>Who encodes, who decodes — compatibility responsibilities differ by mode:</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 620 280" xmlns="http://www.w3.org/2000/svg" font-family="Inter, sans-serif">
+      <text x="310" y="22" text-anchor="middle" font-weight="700" font-size="13">Three dataflow modes</text>
+      <!-- Database -->
+      <rect x="20" y="40" width="180" height="110" rx="8" fill="#dbeafe" stroke="#2563eb"/>
+      <text x="110" y="62" text-anchor="middle" font-weight="700" font-size="11" fill="#2563eb">Via database</text>
+      <text x="110" y="82" text-anchor="middle" font-size="9">Writer encodes → DB stores</text>
+      <text x="110" y="98" text-anchor="middle" font-size="9">Future reader decodes</text>
+      <text x="110" y="118" text-anchor="middle" font-size="9" fill="#1d4ed8" font-weight="600">Both directions ✓✓</text>
+      <text x="110" y="136" text-anchor="middle" font-size="8" fill="#64748b">"Message to your future self"</text>
+      <!-- RPC -->
+      <rect x="220" y="40" width="180" height="110" rx="8" fill="#fef3c7" stroke="#d97706"/>
+      <text x="310" y="62" text-anchor="middle" font-weight="700" font-size="11" fill="#92400e">Via service call</text>
+      <text x="310" y="82" text-anchor="middle" font-size="9">Client encodes request</text>
+      <text x="310" y="98" text-anchor="middle" font-size="9">Server decodes + encodes response</text>
+      <text x="310" y="118" text-anchor="middle" font-size="9" fill="#b45309" font-weight="600">Req: backward · Resp: forward</text>
+      <text x="310" y="136" text-anchor="middle" font-size="8" fill="#64748b">Servers deploy first, clients lag</text>
+      <!-- Message broker -->
+      <rect x="420" y="40" width="180" height="110" rx="8" fill="#d1fae5" stroke="#059669"/>
+      <text x="510" y="62" text-anchor="middle" font-weight="700" font-size="11" fill="#047857">Via message broker</text>
+      <text x="510" y="82" text-anchor="middle" font-size="9">Sender encodes → broker stores</text>
+      <text x="510" y="98" text-anchor="middle" font-size="9">Consumer decodes async</text>
+      <text x="510" y="118" text-anchor="middle" font-size="9" fill="#065f46" font-weight="600">Both directions ✓✓</text>
+      <text x="510" y="136" text-anchor="middle" font-size="8" fill="#64748b">Deploy publishers/consumers any order</text>
+      <!-- Flow arrows -->
+      <rect x="60" y="175" width="500" height="90" rx="8" fill="#f8fafc" stroke="#e5e7eb"/>
+      <text x="310" y="198" text-anchor="middle" font-size="10" font-weight="600">Message brokers (Kafka, RabbitMQ)</text>
+      <text x="310" y="218" text-anchor="middle" font-size="9">Asynchronous, one-way; buffer against unavailable consumers</text>
+      <text x="310" y="236" text-anchor="middle" font-size="9">Redeliver, decouple sender from recipient address</text>
+      <text x="310" y="254" text-anchor="middle" font-size="9" fill="#64748b">Broker doesn't enforce data model — compatibility is on you</text>
+    </svg>
+    <figcaption>Figure 6.1 — Compatibility requirements by dataflow mode.</figcaption>
+  </figure>
+
+  <div class="callout key">
+    <strong>Services: servers first, clients second.</strong> Backward compatibility on <em>requests</em> (old server reads new client fields? No — new server reads old client). Forward compatibility on <em>responses</em> (old client reads new server response).
+  </div>
+</section>
+
+<!-- ═══ 7. RPC ═══ -->
+<section id="rpc">
+  <h2>7. RPC Flaws &amp; Modern Alternatives</h2>
+  <p>RPC fakes local calls ("location transparency") but networks add realities code can't ignore:</p>
+
+  <table>
+    <tr><th>Network reality</th><th>Why RPC hides it at your peril</th></tr>
+    <tr><td><strong>Timeouts with unknown outcome</strong></td><td>Request may have succeeded — retry needs idempotence keys.</td></tr>
+    <tr><td><strong>Wild latency variance</strong></td><td>Local call assumptions break; need futures/async.</td></tr>
+    <tr><td><strong>No pass-by-reference</strong></td><td>Large objects must be copied or referenced by ID.</td></tr>
+    <tr><td><strong>Retries</strong></td><td>Without idempotence, duplicate side effects.</td></tr>
+  </table>
+
+  <div class="card-grid">
+    <div class="card">
+      <h4>Modern RPC</h4>
+      <p>gRPC on Protobuf, Finagle/Thrift, Rest.li — embrace the network with futures and streams. Dominates intra-datacenter.</p>
+    </div>
+    <div class="card">
+      <h4>REST for public APIs</h4>
+      <p>curl-debuggable, no codegen required. Predominant for cross-org boundaries.</p>
+    </div>
+  </div>
+
+  <div class="callout pitfall">
+    <strong>Dead RPC frameworks:</strong> CORBA, EJB/RMI, DCOM — no compatibility story. SOAP/WSDL: codegen-dependent, interop-hostile. Distributed actor frameworks on default Java serialization (Akka default) break rolling upgrades — swap in Protobuf.
+  </div>
+</section>
+
+<!-- ═══ 8. MENTAL MODELS ═══ -->
+<section id="mental-models">
+  <h2>8. Mental Models</h2>
+
+  <div class="card-grid">
+    <div class="card">
+      <h4>1. Data outlives code</h4>
+      <p>Replace all running code in minutes; five-year-old rows sit in original encoding forever. Migrations are expensive — schema evolution makes the DB <em>appear</em> single-schema.</p>
+    </div>
+    <div class="card">
+      <h4>2. Writing to DB = message to future self</h4>
+      <p>Backward compatibility non-negotiable. Forward too — during rolling upgrade, old readers see new writers' data.</p>
+    </div>
+    <div class="card">
+      <h4>3. Tags vs names fork</h4>
+      <p>Protobuf: manual tag bookkeeping, wire-stable renames. Avro: name-matching, program-generated schemas. Pick by schema author.</p>
+    </div>
+    <div class="card">
+      <h4>4. Servers first, clients second</h4>
+      <p>Service deployment assumption → backward-compatible requests, forward-compatible responses.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ═══ 9. ANTI-PATTERNS ═══ -->
+<section id="anti-patterns">
+  <h2>9. Anti-Patterns</h2>
+  <table>
+    <tr><th>Anti-pattern</th><th>Why it fails</th></tr>
+    <tr><td>Language-native serialization for persistent/cross-service data</td><td>Security (RCE), lock-in, no versioning</td></tr>
+    <tr><td>Adding <code>required</code> field or reusing retired tag after v1</td><td>New code can't read old data; silent misinterpretation</td></tr>
+    <tr><td>Decode → update → re-encode dropping unknown fields</td><td>Silently deletes fields newer code wrote (Figure 4-7)</td></tr>
+    <tr><td>Trusting JSON numbers for 64-bit IDs in JavaScript</td><td>Floats corrupt integers &gt; 2^53 — Twitter uses strings</td></tr>
+    <tr><td>RPC pretending network isn't there</td><td>CORBA/EJB/RMI/DCOM dead; timeouts mean unknown outcome</td></tr>
+    <tr><td>Akka default Java serialization</td><td>Breaks rolling upgrades — use Protobuf</td></tr>
+    <tr><td>Avro fields without defaults on evolvable schemas</td><td>Add breaks backward; remove breaks forward</td></tr>
+  </table>
+</section>
+
+<!-- ═══ 10. WORKED EXAMPLE ═══ -->
+<section id="worked-example">
+  <h2>10. Worked Example: Byte Sizes &amp; Schema Changes</h2>
+  <p>One record: <code>{userName: "Martin", favoriteNumber: 1337, interests: ["daydreaming","hacking"]}</code></p>
+
+  <table>
+    <tr><th>Encoding</th><th>Bytes</th><th>What's on the wire</th></tr>
+    <tr><td><strong>JSON</strong></td><td>81</td><td>Field names in every record</td></tr>
+    <tr><td><strong>MessagePack</strong></td><td>66</td><td>Binary JSON — names still present</td></tr>
+    <tr><td><strong>Thrift BinaryProtocol</strong></td><td>59</td><td>Tag + type + value tuples</td></tr>
+    <tr><td><strong>Thrift CompactProtocol</strong></td><td>34</td><td>Varints + packed tag/type bytes</td></tr>
+    <tr><td><strong>Protocol Buffers</strong></td><td>33</td><td>Tag + type + value (no names)</td></tr>
+    <tr><td><strong>Avro</strong></td><td>32</td><td>Pure concatenated values — meaningless without writer schema</td></tr>
+  </table>
+
+  <h3>Schema change walkthrough</h3>
+  <pre>Add photoURL field:
+
+JSON:     just works if readers ignore extras — nothing enforces it
+Protobuf: new tag 4, must be optional/defaulted
+          old readers skip tag 4 (forward ✓)
+          new readers tolerate absence (backward ✓)
+Avro:     add with default ""
+          old schema readers ignore it
+          new schema readers fill default on old data
+
+Remove field:
+Protobuf: only if optional; never reuse tag
+Avro:     only if it had a default (else forward compat breaks)
+
+Rename:
+Protobuf: free — names not on wire
+Avro:     reader-schema aliases — backward but not forward</pre>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 620 160" xmlns="http://www.w3.org/2000/svg" font-family="Inter, sans-serif">
+      <text x="310" y="22" text-anchor="middle" font-weight="700" font-size="13">Byte size comparison — same Person record</text>
+      <rect x="40" y="40" width="80" height="100" rx="4" fill="#fee2e2"/><text x="80" y="95" text-anchor="middle" font-size="10" font-weight="700">81</text><text x="80" y="125" text-anchor="middle" font-size="8">JSON</text>
+      <rect x="130" y="55" width="65" height="85" rx="4" fill="#fef3c7"/><text x="162" y="100" text-anchor="middle" font-size="10" font-weight="700">66</text><text x="162" y="125" text-anchor="middle" font-size="8">MsgPack</text>
+      <rect x="205" y="48" width="65" height="92" rx="4" fill="#fde68a"/><text x="237" y="95" text-anchor="middle" font-size="10" font-weight="700">59</text><text x="237" y="125" text-anchor="middle" font-size="8">Thrift</text>
+      <rect x="280" y="68" width="55" height="72" rx="4" fill="#bbf7d0"/><text x="307" y="105" text-anchor="middle" font-size="10" font-weight="700">34</text><text x="307" y="125" text-anchor="middle" font-size="8">Compact</text>
+      <rect x="345" y="70" width="52" height="70" rx="4" fill="#86efac"/><text x="371" y="105" text-anchor="middle" font-size="10" font-weight="700">33</text><text x="371" y="125" text-anchor="middle" font-size="8">Proto</text>
+      <rect x="407" y="72" width="50" height="68" rx="4" fill="#059669"/><text x="432" y="108" text-anchor="middle" font-size="10" font-weight="700" fill="white">32</text><text x="432" y="125" text-anchor="middle" font-size="8">Avro</text>
+      <text x="500" y="90" font-size="10" fill="#64748b">Schema-driven</text>
+      <text x="500" y="105" font-size="10" fill="#64748b">formats omit</text>
+      <text x="500" y="120" font-size="10" fill="#64748b">field names</text>
+    </svg>
+    <figcaption>Figure 10.1 — Omitting field names from the wire is the main size win over schemaless formats.</figcaption>
+  </figure>
+</section>
+
+<!-- ═══ 11. PROBLEMS SOLVED ═══ -->
+<section id="problems-solved">
+  <h2>11. Problems This Solves</h2>
+  <p>Lowest-leverage chapter across the repo's 28 system-design examples — only one grounds it directly. Most designs don't surface schema evolution as a named concern even where it's implicitly present (any Kafka-based pipeline).</p>
+
+  <table>
+    <tr><th>Mechanism</th><th>Problem it solves</th><th>Example</th></tr>
+    <tr>
+      <td>Backward/forward-compatible message schema across producer, broker, and consumer</td>
+      <td>Producers and consumers deploy independently; neither side can assume the other is on the same schema version</td>
+      <td>Distributed message queue (explicitly requires schema compliance between producer/queue/consumer)</td>
+    </tr>
+  </table>
+</section>
+
+<!-- ═══ 12. CONNECTS TO ═══ -->
+<section id="connects">
+  <h2>12. Connects To (Cross-Chapter)</h2>
+  <table>
+    <tr><th>Chapter</th><th>Connection</th><th>Interview soundbite</th></tr>
+    <tr>
+      <td><strong>Ch 1 Evolvability</strong></td>
+      <td>This chapter is evolvability's data-layer mechanics.</td>
+      <td>"Schema evolution is how you evolve data formats without downtime."</td>
+    </tr>
+    <tr>
+      <td><strong>Ch 2 Data Models</strong></td>
+      <td>Schema-on-read vs schema-on-write: evolution gives flexibility of the former with guarantees of the latter.</td>
+      <td>"Avro/Protobuf = enforced schema-on-read flexibility."</td>
+    </tr>
+    <tr>
+      <td><strong>Ch 7 Transactions</strong></td>
+      <td>"Serializability" (transactions) — unrelated to serialization here.</td>
+      <td>"Don't confuse transaction serializability with data serialization."</td>
+    </tr>
+    <tr>
+      <td><strong>Ch 8 Distributed Troubles</strong></td>
+      <td>Network faults behind RPC's problems — timeouts, unknown outcomes.</td>
+      <td>"RPC retries need idempotence because of Ch 8 network realities."</td>
+    </tr>
+    <tr>
+      <td><strong>Ch 10 Batch Processing</strong></td>
+      <td>Avro object container files in batch/analytic pipelines.</td>
+      <td>"Big analytic files use Avro container format with embedded schema."</td>
+    </tr>
+    <tr>
+      <td><strong>Ch 11 Stream Processing</strong></td>
+      <td>Message brokers/Kafka in depth; schema registry patterns.</td>
+      <td>"Kafka + schema registry = Ch 4 compat at scale."</td>
+    </tr>
+  </table>
+</section>
+
+<!-- ═══ 13. TAKEAWAYS ═══ -->
+<section id="takeaways">
+  <h2>13. Key Takeaways</h2>
+  <ol>
+    <li><strong>Rolling upgrades force coexistence</strong> — design every encoding for backward AND forward compatibility from day one.</li>
+    <li><strong>Schema-driven binary formats</strong> (Thrift/Protobuf/Avro) beat schemaless JSON internally: smaller, self-documenting, compatibility checkable pre-deploy.</li>
+    <li><strong>Decision criteria:</strong> cross-org interchange → JSON/REST; internal static-typed services → Protobuf/gRPC or Thrift; dynamically generated schemas and big analytic files → Avro.</li>
+    <li><strong>Tag numbers are forever:</strong> never reuse, never make post-v1 fields required; in Avro, always give evolvable fields defaults.</li>
+    <li><strong>Compatibility differs by dataflow mode:</strong> databases need both directions; services need backward-compatible requests, forward-compatible responses; brokers need both to deploy in any order.</li>
+    <li><strong>Don't let RPC pretend the network isn't there</strong> — retries need idempotence, timeouts mean unknown outcome.</li>
+  </ol>
+</section>
+
+<!-- ═══ 14. CHECKPOINTS ═══ -->
+<section id="checkpoints">
+  <h2>14. Junior SWE Checkpoints</h2>
+
+  <div class="quiz">
+    <h4>Q1: What's the difference between backward and forward compatibility?</h4>
+    <p><strong>Backward:</strong> newer code reads old data (you know the old format). <strong>Forward:</strong> older code reads new data (old code must skip/ignore unknown fields). Both needed during rolling upgrades.</p>
+  </div>
+  <div class="quiz">
+    <h4>Q2: Why is Protobuf 33 bytes but JSON 81 for the same record?</h4>
+    <p>Protobuf puts tag+type+value on the wire — field names live only in the schema. JSON repeats field names in every record. MessagePack (66 bytes) still carries names.</p>
+  </div>
+  <div class="quiz">
+    <h4>Q3: You add a required field to a Protobuf schema after v1 is in production. What breaks?</h4>
+    <p>New code reading old data without that field fails. Every post-v1 field must be optional or have a default. Required fields are only safe at initial deployment.</p>
+  </div>
+  <div class="quiz">
+    <h4>Q4: How does Avro decode bytes with no tags on the wire?</h4>
+    <p>Reader resolves writer's schema against reader's schema (matched by field name). Reader must obtain writer schema via file header, schema registry, or RPC handshake. Without it, bytes are meaningless.</p>
+  </div>
+  <div class="quiz">
+    <h4>Q5: A service deploys new server before clients update. What compat do you need on requests vs responses?</h4>
+    <p><strong>Requests:</strong> backward compatible — new server must read old client requests. <strong>Responses:</strong> forward compatible — old clients must read new server responses (skip unknown fields).</p>
+  </div>
+  <div class="quiz">
+    <h4>Q6: Why shouldn't old code decode a record to a model object and re-encode it?</h4>
+    <p>Unknown fields get dropped silently — deleting data newer code wrote (Figure 4-7). Same trap when a Kafka consumer re-publishes messages. Preserve unknown fields at application level.</p>
+  </div>
+  <div class="quiz">
+    <h4>Q7: Why does Twitter ship tweet IDs as JSON strings?</h4>
+    <p>JavaScript numbers are IEEE 754 floats — integers above 2^53 lose precision. 64-bit IDs must be strings for JS consumers.</p>
+  </div>
+
+  <h3>Glossary</h3>
+  <table>
+    <tr><th>Term</th><th>Definition</th></tr>
+    <tr><td>Encoding / decoding</td><td>Translating in-memory structures ↔ self-contained byte sequences (serialization/marshalling)</td></tr>
+    <tr><td>Backward compatibility</td><td>Newer code reads data written by older code</td></tr>
+    <tr><td>Forward compatibility</td><td>Older code reads data written by newer code</td></tr>
+    <tr><td>Tag number</td><td>Stable numeric field identifier on Protobuf/Thrift wire — never reuse</td></tr>
+    <tr><td>Writer's schema</td><td>Schema used to encode data (Avro)</td></tr>
+    <tr><td>Reader's schema</td><td>Schema expected by decoder — resolved against writer's schema (Avro)</td></tr>
+    <tr><td>Schema registry</td><td>Central store mapping schema version numbers to full schemas</td></tr>
+    <tr><td>Schema-on-read</td><td>Interpret structure at read time (flexible, weak guarantees)</td></tr>
+    <tr><td>Schema-on-write</td><td>Enforce structure at write time (rigid, strong guarantees)</td></tr>
+    <tr><td>gRPC</td><td>Modern RPC on Protobuf with streams and futures</td></tr>
+    <tr><td>Idempotence</td><td>Retry-safe operations — required because RPC timeouts have unknown outcome</td></tr>
+  </table>
+</section>
+
+<footer class="page-footer">
+  DDIA Visual Guide · Chapter 4 · Part I: Foundations · Next: Ch 5 Replication
+</footer>
+
+</body>
+</html>

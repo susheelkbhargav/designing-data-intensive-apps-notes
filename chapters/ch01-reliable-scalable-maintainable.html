@@ -1,0 +1,469 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>DDIA Visual Guide — Chapter 1: Reliable, Scalable, and Maintainable Applications</title>
+  <link rel="stylesheet" href="../assets/styles.css">
+</head>
+<body>
+
+<header class="cover">
+  <div class="series">Designing Data-Intensive Applications · Visual Companion</div>
+  <h1>Chapter 1<br>Reliable, Scalable, and Maintainable Applications</h1>
+  <p class="subtitle">The three governing concerns when you compose databases, caches, indexes, and processors into a data system</p>
+  <div class="badge">Part I: Foundations · Illustrated · Interview-ready</div>
+  <p class="meta" style="margin-top:2rem;">Martin Kleppmann · Source: claude-skills / ch01-reliable-scalable-maintainable.md</p>
+</header>
+
+<nav class="toc">
+  <h2>Table of Contents</h2>
+  <ol>
+    <li><a href="#core">Core Idea</a></li>
+    <li><a href="#three-concerns">Framework: The Three Concerns</a></li>
+    <li><a href="#load-parameters">Framework: Load Parameters &amp; Scalability Method</a></li>
+    <li><a href="#maintainability">Framework: Maintainability Triad</a></li>
+    <li><a href="#key-concepts">Key Concepts</a></li>
+    <li><a href="#mental-models">Mental Models</a></li>
+    <li><a href="#anti-patterns">Anti-Patterns</a></li>
+    <li><a href="#worked-example">Worked Example: Twitter Fan-Out</a></li>
+    <li><a href="#problems-solved">Problems Each Mechanism Solves</a></li>
+    <li><a href="#connects">Connects To (Cross-Chapter)</a></li>
+    <li><a href="#takeaways">Key Takeaways</a></li>
+    <li><a href="#checkpoints">Junior SWE Checkpoints</a></li>
+  </ol>
+</nav>
+
+<!-- ═══ 1. CORE IDEA ═══ -->
+<section id="core">
+  <h2>1. Core Idea</h2>
+  <p>Data-intensive applications are composed from general-purpose building blocks — databases, caches, search indexes, stream/batch processors — stitched together by application code. Once you do that, you become a <strong>data system designer</strong>.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 620 280" xmlns="http://www.w3.org/2000/svg" font-family="Inter, sans-serif">
+      <text x="310" y="22" text-anchor="middle" font-weight="700" font-size="13">Figure 1-1 — A composite data system</text>
+      <rect x="240" y="40" width="140" height="50" rx="8" fill="#2563eb"/>
+      <text x="310" y="62" text-anchor="middle" fill="white" font-weight="700" font-size="12">Application</text>
+      <text x="310" y="78" text-anchor="middle" fill="#bfdbfe" font-size="9">orchestrates &amp; keeps in sync</text>
+      <rect x="40" y="130" width="110" height="45" rx="6" fill="#64748b"/>
+      <text x="95" y="158" text-anchor="middle" fill="white" font-size="11">Database</text>
+      <rect x="175" y="130" width="110" height="45" rx="6" fill="#64748b"/>
+      <text x="230" y="158" text-anchor="middle" fill="white" font-size="11">Cache</text>
+      <rect x="310" y="130" width="110" height="45" rx="6" fill="#64748b"/>
+      <text x="365" y="158" text-anchor="middle" fill="white" font-size="11">Search Index</text>
+      <rect x="445" y="130" width="110" height="45" rx="6" fill="#64748b"/>
+      <text x="500" y="158" text-anchor="middle" fill="white" font-size="11">Message Queue</text>
+      <line x1="280" y1="90" x2="95" y2="125" stroke="#2563eb" stroke-width="2"/>
+      <line x1="300" y1="90" x2="230" y2="125" stroke="#2563eb" stroke-width="2"/>
+      <line x1="320" y1="90" x2="365" y2="125" stroke="#2563eb" stroke-width="2"/>
+      <line x1="340" y1="90" x2="500" y2="125" stroke="#2563eb" stroke-width="2"/>
+      <rect x="80" y="210" width="460" height="55" rx="8" fill="#f0f9ff" stroke="#2563eb"/>
+      <text x="310" y="233" text-anchor="middle" font-weight="700" font-size="12" fill="#2563eb">Three governing concerns</text>
+      <text x="130" y="253" text-anchor="middle" font-size="10" fill="#1e40af">Reliability</text>
+      <text x="310" y="253" text-anchor="middle" font-size="10" fill="#1e40af">Scalability</text>
+      <text x="490" y="253" text-anchor="middle" font-size="10" fill="#1e40af">Maintainability</text>
+    </svg>
+    <figcaption>Figure 1.1 — Composing building blocks creates a data system; Part III systematizes keeping derived stores in sync.</figcaption>
+  </figure>
+
+  <div class="callout key">
+    <strong>Your job shifts from "using a database" to designing a data system.</strong> Kleppmann's frame: evaluate every design through reliability (works correctly under adversity), scalability (reasonable coping as load grows), and maintainability (many people can work on it productively over time).
+  </div>
+</section>
+
+<!-- ═══ 2. THREE CONCERNS ═══ -->
+<section id="three-concerns">
+  <h2>2. Framework: The Three Concerns</h2>
+  <p><em>Reliability / Scalability / Maintainability</em> — Kleppmann's top-level checklist for any data system design discussion, before diving into technology choices.</p>
+
+  <table>
+    <tr><th>When</th><td>Any system design discussion — use as the top-level checklist before technology choices.</td></tr>
+    <tr><th>How</th><td>
+      <strong>(1) Reliability</strong> — system works correctly (right function, desired performance) even under adversity: hardware faults, software faults, human error.<br>
+      <strong>(2) Scalability</strong> — as load grows (data volume, traffic, complexity), there are reasonable ways to cope; never a yes/no label.<br>
+      <strong>(3) Maintainability</strong> — many people over time (engineering + ops) can work on it productively via operability, simplicity, evolvability.
+    </td></tr>
+    <tr><th>Why it works</th><td>Separates orthogonal risks so you don't over-invest in one (e.g., scaling machinery) while ignoring another (e.g., ops toil).</td></tr>
+    <tr><th>Failure mode</th><td>Treating them as buzzwords instead of asking the concrete questions behind each.</td></tr>
+  </table>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 620 240" xmlns="http://www.w3.org/2000/svg" font-family="Inter, sans-serif">
+      <text x="310" y="22" text-anchor="middle" font-weight="700" font-size="13">The Three Concerns — orthogonal risks</text>
+      <rect x="30" y="45" width="175" height="90" rx="8" fill="#dbeafe" stroke="#2563eb"/>
+      <text x="117" y="72" text-anchor="middle" font-weight="700" font-size="13" fill="#2563eb">Reliability</text>
+      <text x="117" y="92" text-anchor="middle" font-size="9" fill="#1e40af">Hardware · Software · Human faults</text>
+      <text x="117" y="108" text-anchor="middle" font-size="9" fill="#1e40af">Fault-tolerance, not perfection</text>
+      <text x="117" y="124" text-anchor="middle" font-size="9" fill="#64748b">"Works correctly under adversity"</text>
+      <rect x="222" y="45" width="175" height="90" rx="8" fill="#d1fae5" stroke="#059669"/>
+      <text x="309" y="72" text-anchor="middle" font-weight="700" font-size="13" fill="#059669">Scalability</text>
+      <text x="309" y="92" text-anchor="middle" font-size="9" fill="#047857">Load parameters first</text>
+      <text x="309" y="108" text-anchor="middle" font-size="9" fill="#047857">Percentiles, not averages</text>
+      <text x="309" y="124" text-anchor="middle" font-size="9" fill="#64748b">"Reasonable coping as load grows"</text>
+      <rect x="415" y="45" width="175" height="90" rx="8" fill="#ede9fe" stroke="#7c3aed"/>
+      <text x="502" y="72" text-anchor="middle" font-weight="700" font-size="13" fill="#7c3aed">Maintainability</text>
+      <text x="502" y="92" text-anchor="middle" font-size="9" fill="#6d28d9">Operability · Simplicity</text>
+      <text x="502" y="108" text-anchor="middle" font-size="9" fill="#6d28d9">Evolvability</text>
+      <text x="502" y="124" text-anchor="middle" font-size="9" fill="#64748b">"Majority of cost is maintenance"</text>
+      <rect x="80" y="160" width="460" height="65" rx="8" fill="#fef3c7" stroke="#d97706"/>
+      <text x="310" y="185" text-anchor="middle" font-weight="600" font-size="11" fill="#92400e">Failure mode: buzzword checklist without concrete questions</text>
+      <text x="310" y="205" text-anchor="middle" font-size="10" fill="#78350f">"Is it scalable?" → meaningless without naming which load parameter grows and how you'd cope</text>
+    </svg>
+    <figcaption>Figure 2.1 — Three orthogonal concerns; each demands different design questions.</figcaption>
+  </figure>
+
+  <h3>Reliability: fault vs failure</h3>
+  <div class="card-grid">
+    <div class="card"><h4>Fault</h4><p>One component deviating from spec — disk crash, bug, typo in config.</p></div>
+    <div class="card"><h4>Failure</h4><p>Whole system stops providing the required service to the user.</p></div>
+    <div class="card"><h4>Design goal</h4><p>Build fault-tolerance so faults don't become failures. You can only tolerate <em>certain</em> fault types — name them.</p></div>
+  </div>
+
+  <div class="callout realworld">
+    <strong>Fault classes:</strong> Hardware (random, uncorrelated) · Software (systematic, correlated across nodes, dormant until unusual trigger) · Human (config errors = leading cause of outages; hardware only 10–25%). At 10k disks (MTTF 10–50 years), expect ~one disk death per day. Cloud VMs vanish without warning.
+  </div>
+</section>
+
+<!-- ═══ 3. LOAD PARAMETERS ═══ -->
+<section id="load-parameters">
+  <h2>3. Framework: Load Parameters &amp; Scalability Method</h2>
+  <p>You cannot say "X is scalable." You must ask: <strong>"If the system grows in a particular way, what are our options for coping?"</strong></p>
+
+  <table>
+    <tr><th>When</th><td>Any capacity/scaling question — especially interviews. State load parameters first.</td></tr>
+    <tr><th>How</th><td>
+      <strong>(1)</strong> Describe current load with a few numbers — <strong>load parameters</strong> (requests/sec, read/write ratio, active users in a chat room, cache hit rate, follower distribution). Pick the ones your bottleneck depends on; extreme cases often dominate, not the average.<br>
+      <strong>(2)</strong> Describe performance: throughput for batch; <strong>response time distribution</strong> (percentiles, not means) for online.<br>
+      <strong>(3)</strong> Ask: with resources fixed, how does performance degrade as a load parameter grows? How much resource to hold performance constant?<br>
+      <strong>(4)</strong> Choose coping: scale up vs scale out, elastic vs manual.
+    </td></tr>
+    <tr><th>Why it works</th><td>Architectures assume which operations are common vs rare. Wrong assumptions = wasted or counter-productive scaling effort. Expect to rethink architecture roughly every order-of-magnitude load increase.</td></tr>
+    <tr><th>Failure mode</th><td>Attaching "scalable" as a one-dimensional label without stating which load parameter grows.</td></tr>
+  </table>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 620 220" xmlns="http://www.w3.org/2000/svg" font-family="Inter, sans-serif">
+      <text x="310" y="22" text-anchor="middle" font-weight="700" font-size="13">Scalability method — four steps</text>
+      <rect x="20" y="40" width="130" height="55" rx="6" fill="#dbeafe" stroke="#2563eb"/>
+      <text x="85" y="62" text-anchor="middle" font-weight="600" font-size="10" fill="#2563eb">1. Load params</text>
+      <text x="85" y="78" text-anchor="middle" font-size="8" fill="#64748b">req/s, R/W ratio</text>
+      <text x="85" y="88" text-anchor="middle" font-size="8" fill="#64748b">fan-out, hit rate</text>
+      <text x="165" y="70" font-size="16" fill="#94a3b8">→</text>
+      <rect x="180" y="40" width="130" height="55" rx="6" fill="#d1fae5" stroke="#059669"/>
+      <text x="245" y="62" text-anchor="middle" font-weight="600" font-size="10" fill="#059669">2. Performance</text>
+      <text x="245" y="78" text-anchor="middle" font-size="8" fill="#64748b">p50/p95/p99</text>
+      <text x="245" y="88" text-anchor="middle" font-size="8" fill="#64748b">not averages</text>
+      <text x="325" y="70" font-size="16" fill="#94a3b8">→</text>
+      <rect x="340" y="40" width="130" height="55" rx="6" fill="#fef3c7" stroke="#d97706"/>
+      <text x="405" y="62" text-anchor="middle" font-weight="600" font-size="10" fill="#d97706">3. Two questions</text>
+      <text x="405" y="78" text-anchor="middle" font-size="8" fill="#64748b">degrade vs grow?</text>
+      <text x="405" y="88" text-anchor="middle" font-size="8" fill="#64748b">resource to hold?</text>
+      <text x="485" y="70" font-size="16" fill="#94a3b8">→</text>
+      <rect x="500" y="40" width="100" height="55" rx="6" fill="#ede9fe" stroke="#7c3aed"/>
+      <text x="550" y="62" text-anchor="middle" font-weight="600" font-size="10" fill="#7c3aed">4. Cope</text>
+      <text x="550" y="78" text-anchor="middle" font-size="8" fill="#64748b">up / out</text>
+      <text x="550" y="88" text-anchor="middle" font-size="8" fill="#64748b">elastic / manual</text>
+      <rect x="40" y="115" width="540" height="90" rx="8" fill="#f8fafc" stroke="#64748b"/>
+      <text x="310" y="138" text-anchor="middle" font-weight="700" font-size="11">Response time percentiles (client-side)</text>
+      <line x1="60" y1="195" x2="560" y2="195" stroke="#64748b" stroke-width="1"/>
+      <rect x="60" y="155" width="250" height="35" rx="3" fill="#2563eb" opacity="0.7"/>
+      <text x="185" y="177" text-anchor="middle" fill="white" font-size="9" font-weight="600">p50 (median) — typical user</text>
+      <rect x="310" y="155" width="150" height="35" rx="3" fill="#d97706" opacity="0.8"/>
+      <text x="385" y="177" text-anchor="middle" fill="white" font-size="9" font-weight="600">p95 — tail</text>
+      <rect x="460" y="155" width="100" height="35" rx="3" fill="#dc2626" opacity="0.9"/>
+      <text x="510" y="177" text-anchor="middle" fill="white" font-size="9" font-weight="600">p99+</text>
+    </svg>
+    <figcaption>Figure 3.1 — Name load parameters, measure percentiles, then choose coping strategy.</figcaption>
+  </figure>
+
+  <div class="callout analogy">
+    <strong>Scale up vs scale out:</strong> Vertical (bigger machine) vs horizontal (<strong>shared-nothing</strong> across machines). Good architectures pragmatically mix both. Keep stateful data on a single node until cost or HA forces distribution; stateless services distribute easily.
+  </div>
+
+  <div class="callout warning">
+    <strong>No magic scaling sauce:</strong> 100k req/s of 1 kB differs completely from 3 req/min of 2 GB despite equal throughput. 100 ms slower cost Amazon 1% of sales; a 1 s slowdown cuts a satisfaction metric 16%.
+  </div>
+</section>
+
+<!-- ═══ 4. MAINTAINABILITY ═══ -->
+<section id="maintainability">
+  <h2>4. Framework: Maintainability Triad</h2>
+  <p><em>Operability / Simplicity / Evolvability</em> — three design principles to avoid creating legacy software. Most software cost is maintenance, not initial development.</p>
+
+  <table>
+    <tr><th>Principle</th><th>What it means</th><th>How to achieve it</th></tr>
+    <tr>
+      <td><strong>Operability</strong></td>
+      <td>Make routine ops easy for the team running the system</td>
+      <td>Visibility/monitoring, automation support, no single-machine dependency, good defaults with overrides, predictable behavior</td>
+    </tr>
+    <tr>
+      <td><strong>Simplicity</strong></td>
+      <td>Remove <strong>accidental complexity</strong> — complexity not inherent in the problem, only in the implementation (Moseley &amp; Marks)</td>
+      <td>Good <strong>abstractions</strong> — e.g., SQL hides on-disk structures, concurrency, crash recovery</td>
+    </tr>
+    <tr>
+      <td><strong>Evolvability</strong></td>
+      <td>Make change easy — agility at the data-system level</td>
+      <td>Tightly linked to simplicity; easy-to-modify systems require simple foundations</td>
+    </tr>
+  </table>
+
+  <div class="callout key">
+    <strong>Guard against humans, the leading outage cause:</strong> minimize error opportunities via good abstractions, decouple sandboxes (real data, no real users) from production, test at all levels, make rollback fast and rollouts gradual, instrument telemetry.
+  </div>
+</section>
+
+<!-- ═══ 5. KEY CONCEPTS ═══ -->
+<section id="key-concepts">
+  <h2>5. Key Concepts</h2>
+  <table>
+    <tr><th>Term</th><th>Definition</th></tr>
+    <tr><td><strong>Fault vs failure</strong></td><td>Fault = one component deviating from spec; failure = whole system stops serving. Design fault-tolerance so faults don't become failures.</td></tr>
+    <tr><td><strong>Fault-tolerant / resilient</strong></td><td>Anticipates and copes with certain types of faults — never all possible faults.</td></tr>
+    <tr><td><strong>Load parameters</strong></td><td>The few numbers that describe load on your system; the right ones depend on your architecture.</td></tr>
+    <tr><td><strong>Fan-out</strong></td><td>Number of requests to other services needed to serve one incoming request (borrowed from electronics).</td></tr>
+    <tr><td><strong>Response time vs latency</strong></td><td>Response time = what the client sees (service time + network + queueing); latency = time a request waits to be handled.</td></tr>
+    <tr><td><strong>Percentiles (p50/p95/p99/p999)</strong></td><td>Response-time thresholds that a given fraction of requests beat; median = typical, high percentiles = tail experience.</td></tr>
+    <tr><td><strong>Head-of-line blocking</strong></td><td>A few slow requests hold up subsequent ones due to limited parallelism, inflating client-observed response times.</td></tr>
+    <tr><td><strong>Tail latency amplification</strong></td><td>With multiple parallel backend calls per user request, the request waits for the slowest call — rare slow backend calls make many end-user requests slow.</td></tr>
+    <tr><td><strong>Scaling up vs out</strong></td><td>Vertical (bigger machine) vs horizontal (<strong>shared-nothing</strong> across machines); good architectures mix both.</td></tr>
+    <tr><td><strong>Accidental complexity</strong></td><td>Complexity from implementation, not the problem itself — the target of simplification.</td></tr>
+  </table>
+</section>
+
+<!-- ═══ 6. MENTAL MODELS ═══ -->
+<section id="mental-models">
+  <h2>6. Mental Models</h2>
+
+  <div class="card-grid">
+    <div class="card">
+      <h4>1. Reliability = enumerate fault classes</h4>
+      <p>"Continuing to work correctly even when things go wrong." Hardware (random), software (systematic, correlated), human (config errors #1 cause).</p>
+    </div>
+    <div class="card">
+      <h4>2. Chaos engineering</h4>
+      <p>Deliberately increase fault rate (Netflix Chaos Monkey). Many critical bugs are poor error handling — only exercised fault-tolerance machinery is trusted machinery.</p>
+    </div>
+    <div class="card">
+      <h4>3. Percentiles, never averages</h4>
+      <p>Mean doesn't tell you how many users experienced a delay. Never average percentiles across machines/time — aggregate by adding histograms (forward decay, t-digest, HdrHistogram).</p>
+    </div>
+    <div class="card">
+      <h4>4. Write-time vs read-time dial</h4>
+      <p>When reads outnumber writes by orders of magnitude, precompute at write time (fan-out) even though it multiplies write work.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ═══ 7. ANTI-PATTERNS ═══ -->
+<section id="anti-patterns">
+  <h2>7. Anti-Patterns</h2>
+  <table>
+    <tr><th>Anti-pattern</th><th>Why it fails</th></tr>
+    <tr><td>Attaching "scalable" as a one-dimensional label</td><td>Meaningless without stating which load parameter grows and what coping options exist</td></tr>
+    <tr><td>Reporting mean response time</td><td>Hides the tail that your most valuable users hit (Amazon: slowest requests often from customers with most data/purchases)</td></tr>
+    <tr><td>Averaging percentiles</td><td>Mathematically meaningless; add histograms instead</td></tr>
+    <tr><td>Load-testing with sequential client</td><td>Client waits for each response before sending next → artificially short queues, skewed measurements. Load generator must send independently of response time.</td></tr>
+    <tr><td>Chasing extreme tails blindly</td><td>Amazon targets p999 but judged optimizing p9999 too expensive — tail costs rise while benefits diminish</td></tr>
+    <tr><td>Interfaces so restrictive people work around them</td><td>Minimizing human error via lockdown backfires; balance "easy to do the right thing" against escape hatches</td></tr>
+    <tr><td>Premature scaling in unproven product</td><td>Iterating on features usually beats scaling for hypothetical load; architecture built on wrong load-parameter assumptions is wasted effort</td></tr>
+  </table>
+</section>
+
+<!-- ═══ 8. WORKED EXAMPLE ═══ -->
+<section id="worked-example">
+  <h2>8. Worked Example: Twitter Fan-Out (Nov 2012)</h2>
+
+  <p><strong>Load:</strong> post tweet averages 4.6k req/s (12k peak); home-timeline reads 300k req/s. 12k writes/sec alone is easy — the challenge is <strong>fan-out</strong> (each user follows and is followed by many).</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 620 320" xmlns="http://www.w3.org/2000/svg" font-family="Inter, sans-serif">
+      <text x="310" y="20" text-anchor="middle" font-weight="700" font-size="13">Three approaches to home timelines</text>
+      <!-- Approach 1 -->
+      <rect x="15" y="35" width="185" height="120" rx="6" fill="#fee2e2" stroke="#dc2626"/>
+      <text x="107" y="55" text-anchor="middle" font-weight="700" font-size="10" fill="#991b1b">1. Read-time join</text>
+      <text x="107" y="72" text-anchor="middle" font-size="8" fill="#64748b">Write: insert tweet</text>
+      <text x="107" y="85" text-anchor="middle" font-size="8" fill="#64748b">Read: join all followed</text>
+      <text x="107" y="110" text-anchor="middle" font-size="8" fill="#dc2626">300k reads/sec × join</text>
+      <text x="107" y="125" text-anchor="middle" font-size="8" fill="#dc2626">= struggled under load</text>
+      <text x="107" y="145" text-anchor="middle" font-size="8" font-weight="600" fill="#991b1b">Twitter v1</text>
+      <!-- Approach 2 -->
+      <rect x="217" y="35" width="185" height="120" rx="6" fill="#fef3c7" stroke="#d97706"/>
+      <text x="309" y="55" text-anchor="middle" font-weight="700" font-size="10" fill="#92400e">2. Write-time fan-out</text>
+      <text x="309" y="72" text-anchor="middle" font-size="8" fill="#64748b">Write: push to each</text>
+      <text x="309" y="85" text-anchor="middle" font-size="8" fill="#64748b">follower's mailbox</text>
+      <text x="309" y="110" text-anchor="middle" font-size="8" fill="#d97706">4.6k × 75 avg followers</text>
+      <text x="309" y="125" text-anchor="middle" font-size="8" fill="#d97706">= 345k cache writes/sec</text>
+      <text x="309" y="145" text-anchor="middle" font-size="8" font-weight="600" fill="#92400e">Celebrity problem</text>
+      <!-- Approach 3 -->
+      <rect x="419" y="35" width="185" height="120" rx="6" fill="#d1fae5" stroke="#059669"/>
+      <text x="511" y="55" text-anchor="middle" font-weight="700" font-size="10" fill="#047857">3. Hybrid (final)</text>
+      <text x="511" y="72" text-anchor="middle" font-size="8" fill="#64748b">Fan-out for most users</text>
+      <text x="511" y="85" text-anchor="middle" font-size="8" fill="#64748b">Celebrities: read-time merge</text>
+      <text x="511" y="110" text-anchor="middle" font-size="8" fill="#059669">Skew: some users have</text>
+      <text x="511" y="125" text-anchor="middle" font-size="8" fill="#059669">&gt;30M followers</text>
+      <text x="511" y="145" text-anchor="middle" font-size="8" font-weight="600" fill="#047857">Production solution</text>
+      <!-- Fan-out visualization -->
+      <rect x="240" y="175" width="140" height="40" rx="6" fill="#2563eb"/>
+      <text x="310" y="195" text-anchor="middle" fill="white" font-weight="600" font-size="11">Tweet posted</text>
+      <text x="310" y="208" text-anchor="middle" fill="#bfdbfe" font-size="8">4.6k/sec avg</text>
+      <line x1="280" y1="215" x2="100" y2="260" stroke="#2563eb" stroke-width="1.5"/>
+      <line x1="300" y1="215" x2="200" y2="260" stroke="#2563eb" stroke-width="1.5"/>
+      <line x1="310" y1="215" x2="310" y2="260" stroke="#2563eb" stroke-width="1.5"/>
+      <line x1="320" y1="215" x2="420" y2="260" stroke="#2563eb" stroke-width="1.5"/>
+      <line x1="340" y1="215" x2="520" y2="260" stroke="#2563eb" stroke-width="1.5"/>
+      <rect x="60" y="260" width="80" height="30" rx="4" fill="#64748b"/><text x="100" y="280" text-anchor="middle" fill="white" font-size="8">Follower</text>
+      <rect x="160" y="260" width="80" height="30" rx="4" fill="#64748b"/><text x="200" y="280" text-anchor="middle" fill="white" font-size="8">Follower</text>
+      <rect x="270" y="260" width="80" height="30" rx="4" fill="#64748b"/><text x="310" y="280" text-anchor="middle" fill="white" font-size="8">Follower</text>
+      <rect x="380" y="260" width="80" height="30" rx="4" fill="#64748b"/><text x="420" y="280" text-anchor="middle" fill="white" font-size="8">Follower</text>
+      <rect x="480" y="260" width="80" height="30" rx="4" fill="#dc2626"/><text x="520" y="280" text-anchor="middle" fill="white" font-size="8">30M+!</text>
+      <text x="310" y="310" text-anchor="middle" font-size="10" fill="#64748b" font-weight="600">Decisive load parameter: follower distribution per user (weighted by tweet frequency)</text>
+    </svg>
+    <figcaption>Figure 8.1 — Write-time fan-out works when reads ≫ writes, but celebrity skew breaks naive fan-out.</figcaption>
+  </figure>
+
+  <h3>Approach 1: Read-time join</h3>
+  <p>Posting inserts into a global tweets collection; reading a timeline joins tweets from everyone the user follows. Twitter's first version — struggled under home-timeline read load.</p>
+
+  <h3>Approach 2: Write-time fan-out</h3>
+  <p>Keep a per-user timeline cache (mailbox); posting inserts the tweet into every follower's cache, making reads cheap. Works because tweet rate is ~two orders of magnitude below read rate. Cost: average 75 followers turns 4.6k tweets/sec into 345k cache writes/sec. Distribution wildly skewed — some users have &gt;30M followers, so one tweet can mean &gt;30M writes against a ~5-second delivery target.</p>
+
+  <h3>Hybrid (final)</h3>
+  <p>Fan out for most users, but exempt celebrities; their tweets are fetched at read time and merged in — consistently good performance.</p>
+
+  <div class="callout key">
+    <strong>Key lesson:</strong> The follower distribution per user (weighted by tweet frequency) is the decisive load parameter. The write-time vs read-time trade-off dial: when reads outnumber writes by orders of magnitude, precompute at write time even though it multiplies write work.
+  </div>
+</section>
+
+<!-- ═══ 9. PROBLEMS SOLVED ═══ -->
+<section id="problems-solved">
+  <h2>9. Problems Each Mechanism Solves</h2>
+  <table>
+    <tr><th>Mechanism</th><th>Problem it solves</th><th>Example</th></tr>
+    <tr>
+      <td>Load parameters + write/read rate skew → write-time fan-out decision</td>
+      <td>Read rate outnumbers write rate by orders of magnitude; naive read-time join can't keep up</td>
+      <td>News feed system (Twitter fan-out example)</td>
+    </tr>
+    <tr>
+      <td>p99 / tail-latency focus, GC pause named as a threat</td>
+      <td>A single stop-the-world pause blows a millisecond-level SLA on the hot path</td>
+      <td>Stock exchange (round-trip p99 target, GC pause called out explicitly)</td>
+    </tr>
+    <tr>
+      <td>Availability nines + cost-of-downtime math</td>
+      <td>Justify infra spend (CDN, redundancy) against concrete dollar cost of an outage</td>
+      <td>Youtube-style video platform ($150k/day CDN cost framing)</td>
+    </tr>
+    <tr>
+      <td>Master→slave replication + resharding as scale-out response</td>
+      <td>Single-node capacity exhausted; must add machines without a rewrite</td>
+      <td>Generic scaling walkthrough (master-slave, sharding by key)</td>
+    </tr>
+    <tr>
+      <td>Back-of-envelope load/availability estimation</td>
+      <td>Size a system before building — is this 100 req/s or 100k req/s?</td>
+      <td>Any capacity-estimation pass before choosing a Ch 6/7/9 mechanism</td>
+    </tr>
+  </table>
+</section>
+
+<!-- ═══ 10. CONNECTS TO ═══ -->
+<section id="connects">
+  <h2>10. Connects To (Cross-Chapter)</h2>
+  <table>
+    <tr><th>Chapter / Resource</th><th>Connection</th><th>Interview soundbite</th></tr>
+    <tr>
+      <td><strong>Ch 2</strong></td>
+      <td>Data models and query languages are the first layer of abstraction chosen when composing a data system.</td>
+      <td>"SQL is an abstraction that hides on-disk structures and crash recovery."</td>
+    </tr>
+    <tr>
+      <td><strong>Ch 5–6 (Replication/Partitioning)</strong></td>
+      <td>The scale-out / shared-nothing path introduced here; rebalancing partitions revisits elastic vs manual scaling.</td>
+      <td>"Scale out stateless first; stateful adds real complexity."</td>
+    </tr>
+    <tr>
+      <td><strong>Part III (Derived data)</strong></td>
+      <td>The Figure 1-1 composite system (DB + cache + index + queue kept in sync by application code) is the problem those chapters systematize.</td>
+      <td>"One system of record + CDC, not dual-write."</td>
+    </tr>
+    <tr>
+      <td><strong>The Tail at Scale (Dean &amp; Barroso)</strong></td>
+      <td>Canonical treatment of tail-latency amplification across parallel backend calls.</td>
+      <td>"Parallel backends → user waits for slowest; p99 matters."</td>
+    </tr>
+    <tr>
+      <td><strong>SRE practice</strong></td>
+      <td>SLOs/SLAs, telemetry, chaos engineering, and gradual rollouts are the operational embodiment of reliability and operability principles.</td>
+      <td>"SLOs in percentiles; chaos tests fault-tolerance machinery."</td>
+    </tr>
+  </table>
+</section>
+
+<!-- ═══ 11. TAKEAWAYS ═══ -->
+<section id="takeaways">
+  <h2>11. Key Takeaways</h2>
+  <ol>
+    <li><strong>Design fault-tolerance</strong> so component faults don't become system failures; you can only tolerate certain fault types, so name them (hardware, software, human).</li>
+    <li><strong>Prefer software fault-tolerance</strong> over pure hardware redundancy at scale — with 10k disks expect roughly one disk death per day; cloud VMs vanish without warning. Machine-loss tolerance enables rolling patches with zero downtime.</li>
+    <li><strong>Guard against humans</strong>, the leading outage cause: minimize error opportunities via good abstractions, decouple sandboxes from production, test at all levels, make rollback fast and rollouts gradual, instrument telemetry.</li>
+    <li><strong>Start every scalability discussion</strong> by naming load parameters; know whether averages or extreme cases drive your bottleneck.</li>
+    <li><strong>Measure response time as a distribution</strong> on the client side; set SLOs/SLAs in percentiles (e.g., median &lt; 200 ms and p99 &lt; 1 s, up 99.9% of the time).</li>
+    <li><strong>Keep stateful data on a single node</strong> (scale up) until cost or HA forces distribution; stateless services distribute easily. There is no magic scaling sauce.</li>
+    <li><strong>Optimize for maintenance</strong>, the majority of software cost: build in operability, cut accidental complexity with abstractions, and design for evolvability.</li>
+  </ol>
+</section>
+
+<!-- ═══ 12. CHECKPOINTS ═══ -->
+<section id="checkpoints">
+  <h2>12. Junior SWE Checkpoints</h2>
+
+  <div class="quiz">
+    <h4>Q1: What's the difference between a fault and a failure?</h4>
+    <p>A <strong>fault</strong> is one component deviating from spec (disk crash, bug, config typo). A <strong>failure</strong> is the whole system stopping to provide service. Design goal: fault-tolerance so faults don't become failures.</p>
+  </div>
+  <div class="quiz">
+    <h4>Q2: Why can't you say "PostgreSQL is scalable"?</h4>
+    <p>Scalability is not a yes/no label. You must state <strong>which load parameter grows</strong> (req/s? data volume? fan-out?) and <strong>what coping options exist</strong> (scale up, replicate, shard, cache).</p>
+  </div>
+  <div class="quiz">
+    <h4>Q3: Why use p99 instead of mean response time?</h4>
+    <p>Mean hides the tail. Your most valuable users often hit the slowest requests (Amazon finding). p99 tells you what fraction of users experience delays. Never average percentiles across machines — add histograms.</p>
+  </div>
+  <div class="quiz">
+    <h4>Q4: Twitter fan-out — why did write-time fan-out fail for celebrities?</h4>
+    <p>Skewed follower distribution: average 75 followers is fine (4.6k × 75 = 345k writes/sec), but users with &gt;30M followers mean one tweet triggers &gt;30M writes against a ~5s delivery target. Hybrid: fan-out for normal users, read-time merge for celebrities.</p>
+  </div>
+  <div class="quiz">
+    <h4>Q5: What is accidental complexity?</h4>
+    <p>Complexity from the <strong>implementation</strong>, not the problem itself (Moseley &amp; Marks). Target of simplification. Good abstractions (SQL) hide accidental complexity from users.</p>
+  </div>
+  <div class="quiz">
+    <h4>Q6: What is tail latency amplification?</h4>
+    <p>When a user request fans out to multiple parallel backend calls, the end-user waits for the <strong>slowest</strong> call. Even rare slow backend calls make many user requests slow. See "The Tail at Scale" (Dean &amp; Barroso).</p>
+  </div>
+
+  <h3>Glossary</h3>
+  <table>
+    <tr><th>Term</th><th>Definition</th></tr>
+    <tr><td>Load parameter</td><td>A number describing load — req/s, R/W ratio, fan-out, cache hit rate</td></tr>
+    <tr><td>Fan-out</td><td>Requests to other services needed to serve one incoming request</td></tr>
+    <tr><td>Percentile (p50/p95/p99)</td><td>Response-time threshold that a given fraction of requests beat</td></tr>
+    <tr><td>Scale up / scale out</td><td>Vertical (bigger machine) vs horizontal (shared-nothing cluster)</td></tr>
+    <tr><td>Accidental complexity</td><td>Implementation complexity not inherent in the problem</td></tr>
+    <tr><td>Fault-tolerance</td><td>Coping with certain fault types so they don't cause system failure</td></tr>
+    <tr><td>Operability</td><td>Making routine ops easy — monitoring, automation, predictable behavior</td></tr>
+    <tr><td>Evolvability</td><td>Making change easy over the system's lifetime</td></tr>
+    <tr><td>Write-time fan-out</td><td>Precompute at write time (push to followers) when reads ≫ writes</td></tr>
+    <tr><td>Tail latency amplification</td><td>Parallel backends → user waits for slowest call</td></tr>
+  </table>
+</section>
+
+<footer class="page-footer">
+  DDIA Visual Guide · Chapter 1 · Source: claude-skills/ch01-reliable-scalable-maintainable.md · Next: Ch 2 Data Models
+</footer>
+
+</body>
+</html>

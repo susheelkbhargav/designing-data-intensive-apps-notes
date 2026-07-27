@@ -1,0 +1,17 @@
+{
+  "name": "ddia-visual-guides",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "export": "node scripts/export-pdf.js",
+    "export:all": "node scripts/export-pdf.js --all",
+    "install:browser": "npx puppeteer browsers install chrome"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "puppeteer": "^25.4.0"
+  }
+}

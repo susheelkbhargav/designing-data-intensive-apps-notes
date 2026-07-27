@@ -1,0 +1,736 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>DDIA Visual Guide — Chapter 8: The Trouble with Distributed Systems</title>
+  <link rel="stylesheet" href="../assets/styles.css">
+</head>
+<body>
+
+<header class="cover">
+  <div class="series">Designing Data-Intensive Applications · Visual Companion</div>
+  <h1>Chapter 8<br>The Trouble with Distributed Systems</h1>
+  <p class="subtitle">Partial failures, unreliable networks, lying clocks, and arbitrary pauses — and how to engineer reliability anyway</p>
+  <div class="badge">Source: claude-skills / ch08-trouble-with-distributed-systems.md · Illustrated · Interview-ready</div>
+  <p class="meta" style="margin-top:2rem;">Martin Kleppmann · Part II: Distributed Data</p>
+</header>
+
+<nav class="toc">
+  <h2>Table of Contents</h2>
+  <ol>
+    <li><a href="#core">Core Idea</a></li>
+    <li><a href="#system-models">Framework: System Models</a></li>
+    <li><a href="#safety-liveness">Safety vs Liveness</a></li>
+    <li><a href="#timeouts">Unbounded Delays &amp; Timeouts</a></li>
+    <li><a href="#queueing">Queueing &amp; Network Variability</a></li>
+    <li><a href="#switching">Packet vs Circuit Switching</a></li>
+    <li><a href="#clocks">Clocks: Time-of-Day vs Monotonic</a></li>
+    <li><a href="#clock-skew">Clock Skew, Drift &amp; TrueTime</a></li>
+    <li><a href="#timestamps">Timestamps Cannot Order Events</a></li>
+    <li><a href="#pauses">Process Pauses &amp; Stale Checks</a></li>
+    <li><a href="#byzantine">Byzantine Faults</a></li>
+    <li><a href="#mental-models">Mental Models</a></li>
+    <li><a href="#anti-patterns">Anti-Patterns</a></li>
+    <li><a href="#worked-example">Worked Example: Fencing Tokens</a></li>
+    <li><a href="#problems-solved">Problems Each Mechanism Solves</a></li>
+    <li><a href="#connects">Connects To (Cross-Chapter)</a></li>
+    <li><a href="#takeaways">Key Takeaways</a></li>
+    <li><a href="#checkpoints">Junior SWE Checkpoints</a></li>
+  </ol>
+</nav>
+
+<!-- ═══ 1. CORE IDEA ═══ -->
+<section id="core">
+  <h2>1. Core Idea</h2>
+  <p>A single computer is deterministic: it works or it crashes, never something in between. A distributed system loses that idealization — you get <strong>partial failures</strong> that are non-deterministic.</p>
+
+  <div class="card-grid">
+    <div class="card"><h4>🌐 Unreliable network</h4><p>Packets lost, duplicated, reordered, or arbitrarily delayed.</p></div>
+    <div class="card"><h4>🕐 Unreliable clocks</h4><p>Out of sync, jumping forward or backward (NTP, leap seconds).</p></div>
+    <div class="card"><h4>⏸️ Unreliable processes</h4><p>Paused at any point for arbitrary lengths (GC, VM suspend, paging).</p></div>
+  </div>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 620 220" xmlns="http://www.w3.org/2000/svg" font-family="Inter, sans-serif">
+      <text x="310" y="22" text-anchor="middle" font-weight="700" font-size="13">Single machine vs distributed partial failure</text>
+      <rect x="40" y="40" width="240" height="70" rx="8" fill="#d1fae5" stroke="#059669"/>
+      <text x="160" y="68" text-anchor="middle" font-weight="600" font-size="12" fill="#047857">Single computer</text>
+      <text x="160" y="88" text-anchor="middle" font-size="10" fill="#047857">Works ✓  or  Crashed ✗</text>
+      <text x="160" y="102" text-anchor="middle" font-size="10" fill="#047857">Deterministic, knowable state</text>
+      <rect x="340" y="40" width="240" height="70" rx="8" fill="#fee2e2" stroke="#dc2626"/>
+      <text x="460" y="68" text-anchor="middle" font-weight="600" font-size="12" fill="#991b1b">Distributed system</text>
+      <text x="460" y="88" text-anchor="middle" font-size="10" fill="#991b1b">Slow? Lost? Crashed? Paused?</text>
+      <text x="460" y="102" text-anchor="middle" font-size="10" fill="#991b1b">Non-deterministic partial failure</text>
+      <rect x="80" y="130" width="460" height="75" rx="8" fill="#f0f9ff" stroke="#2563eb"/>
+      <text x="310" y="155" text-anchor="middle" font-weight="700" font-size="12" fill="#2563eb">A node knows nothing for sure</text>
+      <text x="310" y="175" text-anchor="middle" font-size="10">It can only guess from messages it receives — or fails to receive</text>
+      <text x="310" y="192" text-anchor="middle" font-size="10" fill="#64748b">Reliability = explicit assumptions (system model) + algorithms proven correct within it</text>
+    </svg>
+    <figcaption>Figure 1.1 — Partial failure replaces the simple "up or down" model.</figcaption>
+  </figure>
+
+  <div class="callout key">
+    <strong>Reliability must be engineered on top of unreliable components</strong> — like TCP over IP. Make assumptions explicit via a <strong>system model</strong>, then design algorithms proven correct within it. A node cannot trust its own judgment; truth is a quorum decision (Ch 9).
+  </div>
+</section>
+
+<!-- ═══ 2. SYSTEM MODELS ═══ -->
+<section id="system-models">
+  <h2>2. Framework: System Models</h2>
+  <p>Formalize what an algorithm may assume: <strong>timing</strong> × <strong>node failure</strong>. State your model before claiming any algorithm is correct.</p>
+
+  <h3>Timing models</h3>
+  <table>
+    <tr><th>Model</th><th>Assumption</th><th>Reality</th></tr>
+    <tr>
+      <td><strong>Synchronous</strong></td>
+      <td>Bounded network delay, bounded process pauses, bounded clock error</td>
+      <td><strong>Unrealistic</strong> for practical internet-scale systems</td>
+    </tr>
+    <tr>
+      <td><strong>Partially synchronous</strong></td>
+      <td>Behaves synchronously <em>most</em> of the time, but bounds are occasionally shattered arbitrarily</td>
+      <td><strong>The realistic model</strong> — most real server-side systems</td>
+    </tr>
+    <tr>
+      <td><strong>Asynchronous</strong></td>
+      <td>No timing assumptions at all — not even a clock or timeouts</td>
+      <td>Very restrictive; few algorithms work here</td>
+    </tr>
+  </table>
+
+  <h3>Node failure models</h3>
+  <table>
+    <tr><th>Model</th><th>Behavior</th><th>When to use</th></tr>
+    <tr>
+      <td><strong>Crash-stop</strong></td>
+      <td>Failed node never returns</td>
+      <td>Simplified analysis; rarely exact in production</td>
+    </tr>
+    <tr>
+      <td><strong>Crash-recovery</strong></td>
+      <td>Nodes crash and may return; stable storage survives, in-memory state lost</td>
+      <td><strong>Default for real systems</strong> — partially synchronous + crash-recovery</td>
+    </tr>
+    <tr>
+      <td><strong>Byzantine</strong></td>
+      <td>Nodes may do anything, including lying and sending corrupted messages</td>
+      <td>Aerospace, blockchain, mutually untrusting orgs</td>
+    </tr>
+  </table>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 620 200" xmlns="http://www.w3.org/2000/svg" font-family="Inter, sans-serif">
+      <text x="310" y="20" text-anchor="middle" font-weight="700" font-size="13">Timing spectrum: sync → partial → async</text>
+      <rect x="40" y="40" width="160" height="55" rx="6" fill="#fee2e2" stroke="#dc2626"/>
+      <text x="120" y="62" text-anchor="middle" font-size="11" font-weight="600">Synchronous</text>
+      <text x="120" y="80" text-anchor="middle" font-size="9" fill="#991b1b">Bounded delays (unrealistic)</text>
+      <rect x="230" y="40" width="160" height="55" rx="6" fill="#d1fae5" stroke="#059669"/>
+      <text x="310" y="62" text-anchor="middle" font-size="11" font-weight="600">Partially sync ✓</text>
+      <text x="310" y="80" text-anchor="middle" font-size="9" fill="#047857">Mostly bounded, occasionally not</text>
+      <rect x="420" y="40" width="160" height="55" rx="6" fill="#fef3c7" stroke="#d97706"/>
+      <text x="500" y="62" text-anchor="middle" font-size="11" font-weight="600">Asynchronous</text>
+      <text x="500" y="80" text-anchor="middle" font-size="9" fill="#92400e">No timing at all</text>
+      <line x1="120" y1="110" x2="500" y2="110" stroke="#64748b" stroke-width="2"/>
+      <polygon points="120,110 130,105 130,115" fill="#64748b"/>
+      <polygon points="500,110 490,105 490,115" fill="#64748b"/>
+      <text x="310" y="135" text-anchor="middle" font-size="10" fill="#64748b">More assumptions ← → Fewer assumptions (harder algorithms)</text>
+      <rect x="80" y="150" width="460" height="40" rx="6" fill="#fee2e2" stroke="#dc2626"/>
+      <text x="310" y="175" text-anchor="middle" font-size="10" fill="#991b1b">Reality leaks: crash-recovery assumes stable storage — GitHub Jan 2016: disk corruption broke quorum assumptions</text>
+    </svg>
+    <figcaption>Figure 2.1 — Partially synchronous + crash-recovery is the practical default.</figcaption>
+  </figure>
+
+  <div class="callout realworld">
+    <strong>When to use:</strong> State your model before claiming correctness. Most real server-side systems: <strong>partially synchronous with crash-recovery faults</strong>. Failure mode: reality leaks — disks corrupt, firmware bugs lose data, silently breaking algorithms that assume nodes remember what they stored.
+  </div>
+</section>
+
+<!-- ═══ 3. SAFETY VS LIVENESS ═══ -->
+<section id="safety-liveness">
+  <h2>3. Safety vs Liveness</h2>
+  <p>Define algorithm correctness precisely by splitting properties into two categories.</p>
+
+  <table>
+    <tr><th>Property</th><th>Meaning</th><th>Examples</th><th>Requirement</th></tr>
+    <tr>
+      <td><strong>Safety</strong></td>
+      <td>"Nothing bad happens" — if violated, you can point at the exact moment it broke, and damage cannot be undone</td>
+      <td>Fencing-token <em>uniqueness</em>, <em>monotonic sequence</em>; no split-brain writes</td>
+      <td>Must hold <strong>always</strong>, even if all nodes crash or network fails entirely</td>
+    </tr>
+    <tr>
+      <td><strong>Liveness</strong></td>
+      <td>"Something good eventually happens" — may not hold now, but hope remains ("eventually" is the giveaway)</td>
+      <td><em>Availability</em>; eventual consistency; "a response will arrive if majority is up"</td>
+      <td>Conditional — e.g., only if majority is up and network eventually recovers</td>
+    </tr>
+  </table>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 620 180" xmlns="http://www.w3.org/2000/svg" font-family="Inter, sans-serif">
+      <text x="310" y="20" text-anchor="middle" font-weight="700" font-size="13">Safety = never break · Liveness = eventually succeed</text>
+      <rect x="40" y="40" width="250" height="120" rx="8" fill="#fee2e2" stroke="#dc2626"/>
+      <text x="165" y="65" text-anchor="middle" font-weight="700" font-size="13" fill="#991b1b">SAFETY</text>
+      <text x="165" y="88" text-anchor="middle" font-size="10">"Nothing bad ever happens"</text>
+      <text x="165" y="108" text-anchor="middle" font-size="10">Violation = irreversible damage</text>
+      <text x="165" y="128" text-anchor="middle" font-size="10">Must hold ALWAYS</text>
+      <text x="165" y="148" text-anchor="middle" font-size="9" fill="#991b1b">e.g. token uniqueness, no corrupt writes</text>
+      <rect x="330" y="40" width="250" height="120" rx="8" fill="#d1fae5" stroke="#059669"/>
+      <text x="455" y="65" text-anchor="middle" font-weight="700" font-size="13" fill="#047857">LIVENESS</text>
+      <text x="455" y="88" text-anchor="middle" font-size="10">"Something good eventually happens"</text>
+      <text x="455" y="108" text-anchor="middle" font-size="10">Violation = stuck waiting (recoverable)</text>
+      <text x="455" y="128" text-anchor="middle" font-size="10">Conditional on system health</text>
+      <text x="455" y="148" text-anchor="middle" font-size="9" fill="#047857">e.g. availability, eventual consistency</text>
+    </svg>
+    <figcaption>Figure 3.1 — Demand hard guarantees where corruption is irreversible; accept best-effort where waiting is tolerable.</figcaption>
+  </figure>
+
+  <div class="callout key">
+    <strong>Eventual consistency is a liveness property</strong> — "eventually" all replicas converge. Safety properties (no lost acknowledged writes, no duplicate primary keys) must never be violated, even during partitions.
+  </div>
+</section>
+
+<!-- ═══ 4. TIMEOUTS ═══ -->
+<section id="timeouts">
+  <h2>4. Unbounded Delays &amp; Timeouts</h2>
+  <p>Asynchronous packet networks give <strong>no delivery-time guarantee</strong>. No response is indistinguishable among many causes.</p>
+
+  <table>
+    <tr><th>Possible cause</th><th>What actually happened</th></tr>
+    <tr><td>Request lost</td><td>Packet dropped in transit</td></tr>
+    <tr><td>Request queued</td><td>Switch or server backlog</td></tr>
+    <tr><td>Remote node crashed</td><td>Process dead</td></tr>
+    <tr><td>Node paused (GC)</td><td>Process alive but frozen — looks dead from outside</td></tr>
+    <tr><td>Response lost</td><td>Server processed, reply never arrived</td></tr>
+    <tr><td>Response delayed</td><td>Still in flight, will arrive late</td></tr>
+  </table>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 620 240" xmlns="http://www.w3.org/2000/svg" font-family="Inter, sans-serif">
+      <text x="310" y="20" text-anchor="middle" font-weight="700" font-size="13">Client sends request… then silence. Why?</text>
+      <rect x="40" y="40" width="80" height="45" rx="6" fill="#2563eb"/><text x="80" y="68" text-anchor="middle" fill="white" font-size="11" font-weight="600">Client</text>
+      <rect x="500" y="40" width="80" height="45" rx="6" fill="#64748b"/><text x="540" y="68" text-anchor="middle" fill="white" font-size="11" font-weight="600">Server</text>
+      <line x1="120" y1="55" x2="480" y2="55" stroke="#2563eb" stroke-width="2" stroke-dasharray="6,3"/>
+      <text x="310" y="50" text-anchor="middle" font-size="9" fill="#2563eb">request →</text>
+      <line x1="480" y1="75" x2="120" y2="75" stroke="#64748b" stroke-width="1" stroke-dasharray="4,4" opacity="0.4"/>
+      <text x="310" y="72" text-anchor="middle" font-size="9" fill="#64748b" opacity="0.6">response? (maybe lost, maybe delayed…)</text>
+      <rect x="60" y="100" width="500" height="125" rx="8" fill="#fef3c7" stroke="#d97706"/>
+      <text x="310" y="125" text-anchor="middle" font-weight="600" font-size="11" fill="#92400e">All look identical to the client:</text>
+      <text x="100" y="150" font-size="10">① Request lost</text>
+      <text x="100" y="168" font-size="10">② Request queued</text>
+      <text x="100" y="186" font-size="10">③ Server crashed</text>
+      <text x="320" y="150" font-size="10">④ Server paused (GC)</text>
+      <text x="320" y="168" font-size="10">⑤ Response lost</text>
+      <text x="320" y="186" font-size="10">⑥ Response delayed</text>
+      <text x="310" y="212" text-anchor="middle" font-size="10" font-weight="600" fill="#92400e">Timeouts are the only detection tool — but they conflate node death with network trouble</text>
+    </svg>
+    <figcaption>Figure 4.1 — Silence tells you nothing. Timeouts are a guess, not proof.</figcaption>
+  </figure>
+
+  <div class="callout warning">
+    <strong>No "correct" timeout exists.</strong> Too-short timeouts falsely declare live nodes dead → load shifts → cascading failure. Measure round-trip distributions and jitter, or adapt continuously (<strong>Phi Accrual failure detector</strong>, used in Akka and Cassandra).
+  </div>
+
+  <div class="callout analogy">
+    <strong>📞 Calling someone who doesn't pick up.</strong> Are they asleep? Phone dead? In a tunnel? Ignoring you? You can't know — you hang up (timeout) and try again. Same ambiguity, same false-alarm risk.
+  </div>
+</section>
+
+<!-- ═══ 5. QUEUEING ═══ -->
+<section id="queueing">
+  <h2>5. Queueing &amp; Network Variability</h2>
+  <p><strong>Queueing is the source of delay variability.</strong> Delays explode near capacity; noisy neighbors in multitenant clouds make them unpredictable.</p>
+
+  <div class="card-grid">
+    <div class="card"><h4>Switch queues</h4><p>Congestion under load — packets wait in line.</p></div>
+    <div class="card"><h4>OS run queues</h4><p>CPU scheduling, thread contention.</p></div>
+    <div class="card"><h4>VM scheduling</h4><p>Hypervisor pauses, CPU steal time.</p></div>
+    <div class="card"><h4>TCP flow control</h4><p>Backpressure, retransmission on loss.</p></div>
+  </div>
+
+  <table>
+    <tr><th>Concrete data point</th><th>What it means</th></tr>
+    <tr><td>~12 network faults/month</td><td>One medium datacenter — half isolating a machine, half a whole rack</td></tr>
+    <tr><td>Switch software upgrade</td><td>Delayed packets over a minute</td></tr>
+    <tr><td>NIC driver bug</td><td>Drops inbound packets while sending outbound fine — "limping" node worse than dead</td></tr>
+  </table>
+
+  <div class="callout pitfall">
+    <strong>🚨 "Limping" nodes</strong> — a Gigabit NIC dropping to 1 Kb/s from a driver bug is worse than a cleanly failed node. The system keeps routing traffic to a node that technically responds but is effectively useless.
+  </div>
+</section>
+
+<!-- ═══ 6. SWITCHING ═══ -->
+<section id="switching">
+  <h2>6. Packet vs Circuit Switching</h2>
+  <table>
+    <tr><th>Model</th><th>How it works</th><th>Delay</th><th>Trade-off</th></tr>
+    <tr>
+      <td><strong>Circuit switching</strong><br>(telephone)</td>
+      <td>Reserves fixed bandwidth end-to-end for the call duration</td>
+      <td><strong>Bounded delay</strong></td>
+      <td>Low utilization — bandwidth idle when not speaking</td>
+    </tr>
+    <tr>
+      <td><strong>Packet switching</strong><br>(Ethernet/IP)</td>
+      <td>Bursty traffic shares links; packets queue under congestion</td>
+      <td><strong>Variable delay</strong></td>
+      <td>High utilization at cost of queueing — a cost/utilization trade-off, not a law of nature</td>
+    </tr>
+  </table>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 620 160" xmlns="http://www.w3.org/2000/svg" font-family="Inter, sans-serif">
+      <text x="310" y="20" text-anchor="middle" font-weight="700" font-size="13">Circuit = reserved lane · Packet = shared highway with traffic jams</text>
+      <rect x="40" y="40" width="250" height="50" rx="6" fill="#d1fae5" stroke="#059669"/>
+      <text x="165" y="62" text-anchor="middle" font-size="11" font-weight="600">Circuit: dedicated 64 Kb/s</text>
+      <text x="165" y="78" text-anchor="middle" font-size="9" fill="#047857">Predictable delay, wasted capacity</text>
+      <rect x="330" y="40" width="250" height="50" rx="6" fill="#fef3c7" stroke="#d97706"/>
+      <text x="455" y="62" text-anchor="middle" font-size="11" font-weight="600">Packet: shared link, burst-friendly</text>
+      <text x="455" y="78" text-anchor="middle" font-size="9" fill="#92400e">High utilization, queueing delays</text>
+      <text x="310" y="120" text-anchor="middle" font-size="10" fill="#64748b">Bounded-delay networks are possible — but at utilization/cost most internet services won't pay</text>
+      <text x="310" y="140" text-anchor="middle" font-size="10" fill="#64748b">If you can stay on a single machine, do — distribution is for fault tolerance and latency, not fashion</text>
+    </svg>
+    <figcaption>Figure 6.1 — Variable delay is an engineering trade-off, not inevitability.</figcaption>
+  </figure>
+</section>
+
+<!-- ═══ 7. CLOCKS ═══ -->
+<section id="clocks">
+  <h2>7. Clocks: Time-of-Day vs Monotonic</h2>
+  <table>
+    <tr><th>Clock type</th><th>API</th><th>Behavior</th><th>Use for</th></tr>
+    <tr>
+      <td><strong>Time-of-day</strong><br>(wall-clock)</td>
+      <td><code>clock_gettime(CLOCK_REALTIME)</code><br><code>System.currentTimeMillis()</code></td>
+      <td>NTP-synced but can be forcibly reset — <strong>jumps backwards</strong></td>
+      <td>Human-readable timestamps, log correlation</td>
+    </tr>
+    <tr>
+      <td><strong>Monotonic</strong></td>
+      <td><code>CLOCK_MONOTONIC</code><br><code>System.nanoTime()</code></td>
+      <td>Always moves forward; absolute values meaningless across machines</td>
+      <td><strong>Timeouts, durations, latency measurement</strong></td>
+    </tr>
+  </table>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 620 200" xmlns="http://www.w3.org/2000/svg" font-family="Inter, sans-serif">
+      <text x="310" y="20" text-anchor="middle" font-weight="700" font-size="13">Wall clock can jump · Monotonic never goes backward</text>
+      <line x1="60" y1="100" x2="280" y2="100" stroke="#64748b" stroke-width="2"/>
+      <text x="60" y="85" font-size="10" font-weight="600">Time-of-day</text>
+      <circle cx="120" cy="100" r="5" fill="#2563eb"/>
+      <circle cx="180" cy="100" r="5" fill="#2563eb"/>
+      <circle cx="200" cy="70" r="5" fill="#dc2626"/>
+      <text x="200" y="60" text-anchor="middle" font-size="9" fill="#dc2626" font-weight="600">NTP jump back!</text>
+      <line x1="200" y1="70" x2="240" y2="100" stroke="#dc2626" stroke-width="2" stroke-dasharray="4,2"/>
+      <circle cx="240" cy="100" r="5" fill="#2563eb"/>
+      <circle cx="260" cy="100" r="5" fill="#2563eb"/>
+      <line x1="360" y1="100" x2="560" y2="100" stroke="#64748b" stroke-width="2"/>
+      <text x="360" y="85" font-size="10" font-weight="600">Monotonic</text>
+      <circle cx="400" cy="100" r="5" fill="#059669"/>
+      <circle cx="440" cy="100" r="5" fill="#059669"/>
+      <circle cx="480" cy="100" r="5" fill="#059669"/>
+      <circle cx="520" cy="100" r="5" fill="#059669"/>
+      <text x="460" y="130" text-anchor="middle" font-size="9" fill="#059669">Always forward — safe for elapsed time</text>
+      <rect x="60" y="150" width="500" height="40" rx="6" fill="#fee2e2" stroke="#dc2626"/>
+      <text x="310" y="175" text-anchor="middle" font-size="10" fill="#991b1b">Never use time-of-day for elapsed time or event ordering across nodes</text>
+    </svg>
+    <figcaption>Figure 7.1 — Monotonic for durations; wall clock for human timestamps only.</figcaption>
+  </figure>
+
+  <div class="callout warning">
+    <strong>Never compare a lease expiry set by a remote clock against local time-of-day</strong> — clock skew silently breaks the lease protocol.
+  </div>
+</section>
+
+<!-- ═══ 8. CLOCK SKEW ═══ -->
+<section id="clock-skew">
+  <h2>8. Clock Skew, Drift &amp; TrueTime</h2>
+
+  <table>
+    <tr><th>Phenomenon</th><th>Data</th><th>Impact</th></tr>
+    <tr>
+      <td><strong>Quartz drift</strong></td>
+      <td>Google assumes 200 ppm → 6 ms drift per 30 s sync interval; 17 s/day</td>
+      <td>Clocks diverge between NTP syncs</td>
+    </tr>
+    <tr>
+      <td><strong>NTP over internet</strong></td>
+      <td>~35 ms minimum error; spikes to ~1 s under congestion</td>
+      <td>Cross-datacenter ordering unreliable</td>
+    </tr>
+    <tr>
+      <td><strong>Leap seconds</strong></td>
+      <td>59- or 61-second minutes</td>
+      <td>Have crashed major systems — mitigate by <em>smearing</em> over a day</td>
+    </tr>
+  </table>
+
+  <div class="callout key">
+    <strong>A clock reading is really a confidence interval, not a point.</strong> Spanner's <strong>TrueTime</strong> returns <code>[earliest, latest]</code> and waits out the interval before committing so transaction timestamps reflect causality. GPS/atomic clocks per datacenter keep uncertainty ~7 ms.
+  </div>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 620 180" xmlns="http://www.w3.org/2000/svg" font-family="Inter, sans-serif">
+      <text x="310" y="20" text-anchor="middle" font-weight="700" font-size="13">Spanner TrueTime: clock = interval, not point</text>
+      <line x1="80" y1="90" x2="540" y2="90" stroke="#64748b" stroke-width="2"/>
+      <text x="80" y="80" font-size="9" fill="#64748b">earlier</text>
+      <text x="540" y="80" font-size="9" fill="#64748b" text-anchor="end">later</text>
+      <rect x="200" y="75" width="220" height="30" rx="4" fill="#dbeafe" stroke="#2563eb"/>
+      <text x="310" y="95" text-anchor="middle" font-size="10" font-weight="600" fill="#2563eb">Uncertainty interval (~7 ms)</text>
+      <text x="310" y="130" text-anchor="middle" font-size="10">Commit waits until TT.now().earliest &gt; commit timestamp</text>
+      <text x="310" y="150" text-anchor="middle" font-size="10" fill="#64748b">Connects to Ch 7 snapshot isolation's monotonic transaction IDs across datacenters</text>
+      <text x="310" y="168" text-anchor="middle" font-size="9" fill="#64748b">Snowflake IDs (41-bit timestamp) must own up to what happens when clocks drift</text>
+    </svg>
+    <figcaption>Figure 8.1 — Treat wall-clock readings as intervals; wait out uncertainty for causal ordering.</figcaption>
+  </figure>
+</section>
+
+<!-- ═══ 9. TIMESTAMPS ═══ -->
+<section id="timestamps">
+  <h2>9. Timestamps Cannot Order Events</h2>
+  <p><strong>Last-write-wins (LWW)</strong> in Cassandra/Riak with time-of-day timestamps silently drops causally-later writes when the later writer's clock lags — data vanishes with no error.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 620 200" xmlns="http://www.w3.org/2000/svg" font-family="Inter, sans-serif">
+      <text x="310" y="20" text-anchor="middle" font-weight="700" font-size="13">LWW + clock skew = silent data loss</text>
+      <rect x="40" y="40" width="240" height="55" rx="6" fill="#d1fae5" stroke="#059669"/>
+      <text x="160" y="62" text-anchor="middle" font-size="10" font-weight="600">Node A writes at T=100 (local clock)</text>
+      <text x="160" y="80" text-anchor="middle" font-size="9" fill="#047857">Causally first — sets color=blue</text>
+      <rect x="340" y="40" width="240" height="55" rx="6" fill="#dbeafe" stroke="#2563eb"/>
+      <text x="460" y="62" text-anchor="middle" font-size="10" font-weight="600">Node B writes at T=95 (clock lagging!)</text>
+      <text x="460" y="80" text-anchor="middle" font-size="9" fill="#2563eb">Causally later — sets color=red</text>
+      <rect x="120" y="110" width="380" height="45" rx="6" fill="#fee2e2" stroke="#dc2626"/>
+      <text x="310" y="132" text-anchor="middle" font-size="11" font-weight="600" fill="#991b1b">LWW picks T=100 (blue) — red write silently discarded</text>
+      <text x="310" y="148" text-anchor="middle" font-size="9" fill="#991b1b">No error, no conflict — data just vanishes</text>
+      <text x="310" y="180" text-anchor="middle" font-size="10" fill="#64748b">Fix: logical clocks (counters tracking happens-before) for ordering, not physical clocks</text>
+    </svg>
+    <figcaption>Figure 9.1 — Physical timestamps ≠ causal order. Ch 5 LWW conflicts bite here.</figcaption>
+  </figure>
+
+  <div class="callout key">
+    Use <strong>logical clocks</strong> (Lamport timestamps, version vectors from Ch 5) for ordering. Physical clocks for human display only. Connects to Ch 5 replication LWW and Ch 7 transaction IDs.
+  </div>
+</section>
+
+<!-- ═══ 10. PAUSES ═══ -->
+<section id="pauses">
+  <h2>10. Process Pauses &amp; Stale Checks</h2>
+  <p>A thread can be preempted at any point for any duration and resume without noticing — so a lease-validity check made before processing may be stale by the time the write executes.</p>
+
+  <div class="card-grid">
+    <div class="card"><h4>Stop-the-world GC</h4><p>Minutes have been observed — blows p99 SLA.</p></div>
+    <div class="card"><h4>VM suspension</h4><p>Live migration, hypervisor scheduling.</p></div>
+    <div class="card"><h4>Disk I/O / paging</h4><p>Synchronous I/O, page faults, thrashing.</p></div>
+    <div class="card"><h4>SIGSTOP / laptop lid</h4><p>Process frozen externally, resumes unaware.</p></div>
+  </div>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 620 220" xmlns="http://www.w3.org/2000/svg" font-family="Inter, sans-serif">
+      <text x="310" y="20" text-anchor="middle" font-weight="700" font-size="13">GC pause makes client-side lease check useless</text>
+      <line x1="60" y1="180" x2="560" y2="180" stroke="#64748b" stroke-width="1"/>
+      <text x="60" y="195" font-size="9" fill="#64748b">time →</text>
+      <rect x="80" y="50" width="60" height="30" rx="4" fill="#059669"/><text x="110" y="70" text-anchor="middle" fill="white" font-size="9">Acquire lease</text>
+      <rect x="160" y="50" width="120" height="30" rx="4" fill="#dc2626"/><text x="220" y="70" text-anchor="middle" fill="white" font-size="9">GC PAUSE (long!)</text>
+      <rect x="300" y="50" width="80" height="30" rx="4" fill="#d97706"/><text x="340" y="70" text-anchor="middle" fill="white" font-size="9">Lease expires</text>
+      <rect x="400" y="50" width="60" height="30" rx="4" fill="#7c3aed"/><text x="430" y="70" text-anchor="middle" fill="white" font-size="9">Client 2 writes</text>
+      <rect x="480" y="50" width="80" height="30" rx="4" fill="#dc2626"/><text x="520" y="70" text-anchor="middle" fill="white" font-size="9">Client 1 wakes, writes!</text>
+      <line x1="110" y1="80" x2="110" y2="160" stroke="#059669" stroke-width="1" stroke-dasharray="3,2"/>
+      <text x="110" y="155" text-anchor="middle" font-size="8" fill="#059669">C1 thinks lease valid</text>
+      <rect x="80" y="110" width="480" height="35" rx="6" fill="#fee2e2" stroke="#dc2626"/>
+      <text x="320" y="132" text-anchor="middle" font-size="10" fill="#991b1b">Client-side check before pause is stale by write time → corruption</text>
+    </svg>
+    <figcaption>Figure 10.1 — The check itself can be stale. Protect resources server-side (fencing tokens).</figcaption>
+  </figure>
+
+  <div class="callout analogy">
+    <strong>🧵 Distributed systems = multithreading without shared memory.</strong> Arbitrary pauses and interleavings, but none of the tools (mutexes, atomics) translate — only messages over an unreliable network. Assume execution can stop mid-function while the rest of the world moves on.
+  </div>
+</section>
+
+<!-- ═══ 11. BYZANTINE ═══ -->
+<section id="byzantine">
+  <h2>11. Byzantine Faults</h2>
+  <p>Nodes that "lie" — send arbitrary corrupted or malicious messages (<strong>Byzantine Generals Problem</strong>, Lamport).</p>
+
+  <table>
+    <tr><th>Context</th><th>Why Byzantine matters</th></tr>
+    <tr><td>Aerospace</td><td>Radiation flips memory bits</td></tr>
+    <tr><td>Blockchain / multi-org</td><td>Mutually untrusting participants</td></tr>
+    <tr><td>Most datacenters</td><td><strong>Rightfully assume non-Byzantine</strong> — you control all nodes</td></tr>
+  </table>
+
+  <div class="card-grid">
+    <div class="card"><h4>BFT cost</h4><p>Need &gt;2/3 supermajority of correct nodes. Expensive protocols.</p></div>
+    <div class="card"><h4>Same software</h4><p>Attacker who compromises one node can likely compromise all — auth/firewalls are the real defense.</p></div>
+    <div class="card"><h4>Weak lying</h4><p>Still guard: checksums, input sanitization, NTP outlier rejection.</p></div>
+  </div>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 620 180" xmlns="http://www.w3.org/2000/svg" font-family="Inter, sans-serif">
+      <text x="310" y="20" text-anchor="middle" font-weight="700" font-size="13">Byzantine Generals: loyal vs traitor nodes</text>
+      <circle cx="120" cy="90" r="35" fill="#059669"/><text x="120" y="95" text-anchor="middle" fill="white" font-size="11" font-weight="600">General A</text>
+      <circle cx="310" cy="90" r="35" fill="#dc2626"/><text x="310" y="95" text-anchor="middle" fill="white" font-size="11" font-weight="600">Traitor</text>
+      <circle cx="500" cy="90" r="35" fill="#059669"/><text x="500" y="95" text-anchor="middle" fill="white" font-size="11" font-weight="600">General C</text>
+      <line x1="155" y1="80" x2="275" y2="80" stroke="#64748b" stroke-width="2"/>
+      <line x1="155" y1="100" x2="275" y2="100" stroke="#64748b" stroke-width="2"/>
+      <line x1="345" y1="80" x2="465" y2="80" stroke="#dc2626" stroke-width="2" stroke-dasharray="5,3"/>
+      <line x1="345" y1="100" x2="465" y2="100" stroke="#dc2626" stroke-width="2" stroke-dasharray="5,3"/>
+      <text x="310" y="150" text-anchor="middle" font-size="10">Traitor sends conflicting messages → agreement impossible without &gt;2/3 honest majority</text>
+      <text x="310" y="168" text-anchor="middle" font-size="9" fill="#64748b">Fencing stops error, not deliberate forgery — that's Byzantine territory</text>
+    </svg>
+    <figcaption>Figure 11.1 — Most datacenter systems assume crash-recovery, not Byzantine.</figcaption>
+  </figure>
+</section>
+
+<!-- ═══ 12. MENTAL MODELS ═══ -->
+<section id="mental-models">
+  <h2>12. Mental Models</h2>
+
+  <div class="card-grid">
+    <div class="card">
+      <h4>1. Truth = majority</h4>
+      <p>A node cannot trust its own judgment — semi-disconnected, or waking from 1-minute GC not knowing it was declared dead. Decisions (including "is X dead?") belong to a <strong>quorum</strong>. One majority only; outvoted nodes must step down.</p>
+    </div>
+    <div class="card">
+      <h4>2. Multithreading without shared memory</h4>
+      <p>Arbitrary pauses and interleavings, but no mutexes/atomics — only messages over unreliable network. Execution can stop mid-function while the world moves on.</p>
+    </div>
+    <div class="card">
+      <h4>3. Reliable from unreliable (up to a limit)</h4>
+      <p>TCP over IP, error-correcting codes. Higher layer removes some fault classes (loss, duplication, reordering) but not others (delay). Know which faults your abstraction absorbs.</p>
+    </div>
+    <div class="card">
+      <h4>4. Cloud vs supercomputer</h4>
+      <p>HPC: partial failure → total failure, restart from checkpoint. Internet services: tolerate failed nodes while serving. At scale, "something is always broken" — giving up is not a strategy.</p>
+    </div>
+  </div>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 620 160" xmlns="http://www.w3.org/2000/svg" font-family="Inter, sans-serif">
+      <text x="310" y="20" text-anchor="middle" font-weight="700" font-size="13">Node declared dead by quorum must step down — even if it feels alive</text>
+      <circle cx="160" cy="85" r="30" fill="#64748b"/><text x="160" y="90" text-anchor="middle" fill="white" font-size="10">Node X</text>
+      <text x="160" y="130" text-anchor="middle" font-size="9" fill="#64748b">"I'm fine!" (after GC pause)</text>
+      <rect x="280" y="55" width="160" height="60" rx="8" fill="#2563eb"/>
+      <text x="360" y="80" text-anchor="middle" fill="white" font-size="11" font-weight="600">Quorum (majority)</text>
+      <text x="360" y="98" text-anchor="middle" fill="#bfdbfe" font-size="10">"X is dead"</text>
+      <line x1="190" y1="85" x2="275" y2="85" stroke="#dc2626" stroke-width="2" stroke-dasharray="4,2"/>
+      <text x="232" y="78" font-size="8" fill="#dc2626">can't send</text>
+      <rect x="480" y="65" width="100" height="40" rx="6" fill="#fee2e2" stroke="#dc2626"/>
+      <text x="530" y="90" text-anchor="middle" font-size="10" fill="#991b1b" font-weight="600">Must step down</text>
+    </svg>
+    <figcaption>Figure 12.1 — Self-assessment is worthless; quorum decides truth.</figcaption>
+  </figure>
+</section>
+
+<!-- ═══ 13. ANTI-PATTERNS ═══ -->
+<section id="anti-patterns">
+  <h2>13. Anti-Patterns</h2>
+  <table>
+    <tr><th>Anti-pattern</th><th>Why it fails</th></tr>
+    <tr><td>Comparing lease expiry (remote clock) against local time-of-day</td><td>Clock skew silently breaks lease protocol</td></tr>
+    <tr><td>Trusting client's belief it holds lock/lease without server-side verification</td><td>Split-brain writers after GC pause or partition</td></tr>
+    <tr><td>LWW conflict resolution on time-of-day timestamps</td><td>Causally later writes silently dropped — no error surfaced</td></tr>
+    <tr><td>Timeouts as constants picked by intuition</td><td>False-positive death declarations → cascading failure. Measure RTT distributions or use Phi Accrual</td></tr>
+    <tr><td>Assuming node is working or dead (binary)</td><td>"Limping" nodes (1 Kb/s NIC) worse than cleanly failed — system keeps routing to them</td></tr>
+    <tr><td>Relying on synchronized clocks without monitoring offsets</td><td>Drifting clock causes silent data loss, not crash — evict nodes whose clocks drift too far</td></tr>
+    <tr><td>Leaving network-fault handling undefined/untested</td><td>Clusters deadlocked permanently; netsplit deleted all data (Elasticsearch, Redis Sentinel). Inject faults deliberately (chaos monkey)</td></tr>
+  </table>
+</section>
+
+<!-- ═══ 14. WORKED EXAMPLE ═══ -->
+<section id="worked-example">
+  <h2>14. Worked Example: Fencing Tokens</h2>
+  <p>Scenario: a file in a storage service must be written by one client at a time, enforced by leases from a lock service (<strong>HBase actually had this bug</strong>).</p>
+
+  <h3>The bug: lease + GC pause</h3>
+  <pre>1. Client 1 acquires lease for file F
+2. Client 1 hits stop-the-world GC pause longer than lease TTL
+3. Lease expires; Client 2 acquires lease and writes to F
+4. Client 1 wakes, still believes lease valid (nothing told the paused thread)
+5. Client 1 writes too → writes clash and corrupt F
+
+Client-side lease checking CANNOT fix this:
+  check_lease()  // passes — lease was valid when checked
+  [GC PAUSE — lease expires, Client 2 writes]
+  write_to_file()  // stale check — corruption</pre>
+
+  <h3>The fix: server-side fencing tokens</h3>
+  <pre>Lock service returns a fencing token with every grant —
+  a number that increases monotonically (ZooKeeper zxid or cversion).
+
+Every write must carry its token.
+Storage service checks and rejects any write whose token ≤ last processed.
+
+Timeline:
+  Client 1 gets token 33, then GC pauses
+  Client 2 gets token 34, writes (storage records max=34) ✓
+  Client 1 wakes, writes with token 33 → REJECTED (33 &lt; 34) ✓
+
+Required properties:
+  Safety: uniqueness + monotonic sequence (must NEVER break)
+  Liveness: availability (lock service keeps granting tokens)</pre>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 620 260" xmlns="http://www.w3.org/2000/svg" font-family="Inter, sans-serif">
+      <text x="310" y="20" text-anchor="middle" font-weight="700" font-size="13">Fencing tokens: storage rejects stale writes</text>
+      <rect x="40" y="40" width="100" height="40" rx="6" fill="#2563eb"/><text x="90" y="65" text-anchor="middle" fill="white" font-size="10" font-weight="600">Lock Svc</text>
+      <rect x="240" y="40" width="100" height="40" rx="6" fill="#64748b"/><text x="290" y="65" text-anchor="middle" fill="white" font-size="10">Client 1</text>
+      <rect x="400" y="40" width="100" height="40" rx="6" fill="#64748b"/><text x="450" y="65" text-anchor="middle" fill="white" font-size="10">Client 2</text>
+      <rect x="520" y="40" width="80" height="40" rx="6" fill="#059669"/><text x="560" y="65" text-anchor="middle" fill="white" font-size="10">Storage</text>
+      <text x="90" y="100" text-anchor="middle" font-size="9">grant token 33</text>
+      <line x1="90" y1="85" x2="290" y2="85" stroke="#2563eb" stroke-width="1.5"/>
+      <rect x="240" y="105" width="100" height="25" rx="4" fill="#dc2626"/><text x="290" y="122" text-anchor="middle" fill="white" font-size="9">GC PAUSE</text>
+      <text x="90" y="150" text-anchor="middle" font-size="9">grant token 34</text>
+      <line x1="90" y1="135" x2="450" y2="135" stroke="#2563eb" stroke-width="1.5"/>
+      <text x="500" y="150" font-size="9">write(34) ✓</text>
+      <line x1="450" y1="155" x2="555" y2="155" stroke="#059669" stroke-width="1.5"/>
+      <text x="290" y="175" font-size="9">write(33) ✗ rejected</text>
+      <line x1="290" y1="180" x2="555" y2="180" stroke="#dc2626" stroke-width="1.5" stroke-dasharray="4,2"/>
+      <rect x="80" y="200" width="460" height="50" rx="6" fill="#d1fae5" stroke="#059669"/>
+      <text x="310" y="222" text-anchor="middle" font-size="10" fill="#047857" font-weight="600">Resource takes active role — never assume clients are well-behaved</text>
+      <text x="310" y="240" text-anchor="middle" font-size="9" fill="#047857">Limit: stops error, not deliberate forgery (Byzantine). Underpins Ch 9 leader election examples.</text>
+    </svg>
+    <figcaption>Figure 14.1 — Monotonic fencing tokens make stale writes safe to reject server-side.</figcaption>
+  </figure>
+
+  <div class="callout key">
+    <strong>Key insight:</strong> The resource (storage) takes an active role in enforcement. Client-side lease checks are always stale-able. Fencing provides <em>safety</em> (uniqueness + monotonicity); lock service availability is <em>liveness</em>.
+  </div>
+</section>
+
+<!-- ═══ 15. PROBLEMS SOLVED ═══ -->
+<section id="problems-solved">
+  <h2>15. Problems Each Mechanism Solves</h2>
+  <table>
+    <tr><th>Mechanism</th><th>Problem it solves</th><th>Example</th></tr>
+    <tr>
+      <td>Named clock-sync assumption ("NTP-synchronized clocks")</td>
+      <td>ID generator must produce roughly time-ordered IDs without coordination — and must own up to what happens when clocks drift</td>
+      <td>Unique-ID generator (Snowflake's 41-bit timestamp)</td>
+    </tr>
+    <tr>
+      <td>GC-pause / tail-latency awareness</td>
+      <td>Stop-the-world pause at the wrong moment blows the p99 SLA</td>
+      <td>Stock exchange (explicit p99-latency + GC-pause callout)</td>
+    </tr>
+    <tr>
+      <td>Heartbeat + tuned timeout for liveness</td>
+      <td>Distinguish "offline" from "just slow" without false-positive churn</td>
+      <td>Chat system presence; metrics monitoring pull-model scrape as health check</td>
+    </tr>
+    <tr>
+      <td>Short timeouts + defense against indistinguishable-slow-vs-dead</td>
+      <td>Crawler must not let one unresponsive host stall the whole frontier</td>
+      <td>Web crawler</td>
+    </tr>
+    <tr>
+      <td>Accepting retry ≠ knowing failure</td>
+      <td>Third-party API call outcome genuinely unknown until it resolves</td>
+      <td>Notification system (APNS/FCM/SendGrid retries)</td>
+    </tr>
+    <tr>
+      <td>Fencing tokens on the resource, not client-side lease checks</td>
+      <td>Paused leader/lock-holder waking late must not corrupt state</td>
+      <td>Underpins every leader-election use in Ch 9 (S3 placement, digital wallet, stock exchange)</td>
+    </tr>
+  </table>
+</section>
+
+<!-- ═══ 16. CONNECTS TO ═══ -->
+<section id="connects">
+  <h2>16. Connects To (Cross-Chapter)</h2>
+  <table>
+    <tr><th>Chapter</th><th>Connection</th><th>Interview soundbite</th></tr>
+    <tr>
+      <td><strong>Ch 5 Replication</strong></td>
+      <td>Leader failover, replication lag, and LWW conflicts are where these faults first bite</td>
+      <td>"Never order events by wall clock — LWW silently drops writes when clocks skew."</td>
+    </tr>
+    <tr>
+      <td><strong>Ch 7 Transactions</strong></td>
+      <td>Snapshot isolation's monotonic transaction IDs are what Spanner's TrueTime approximates across datacenters</td>
+      <td>"TrueTime waits out clock uncertainty so commit timestamps respect causality."</td>
+    </tr>
+    <tr>
+      <td><strong>Ch 9 Consistency &amp; Consensus</strong></td>
+      <td>The payoff — quorums, consensus, and total ordering provide guarantees within the partially-synchronous/crash-recovery model this chapter motivates</td>
+      <td>"Truth is a quorum decision. Ch 9 gives you the algorithms."</td>
+    </tr>
+  </table>
+</section>
+
+<!-- ═══ 17. TAKEAWAYS ═══ -->
+<section id="takeaways">
+  <h2>17. Key Takeaways</h2>
+  <ol>
+    <li><strong>Partial failure is the defining property</strong> of distributed systems: operations non-deterministically fail, go slow, or vanish — and you may never learn whether they succeeded.</li>
+    <li><strong>No response tells you nothing about why</strong>; timeouts are the only failure detector and they conflate node death with network trouble.</li>
+    <li><strong>Never use time-of-day clocks</strong> for elapsed time or event ordering; monotonic clocks for durations, logical clocks for ordering, and treat any wall-clock reading as a confidence interval.</li>
+    <li><strong>Any thread can pause arbitrarily long</strong> at any point (GC, VM suspend, paging) and resume unaware — protect resources server-side with fencing tokens, not client-side lease checks.</li>
+    <li><strong>A node's self-assessment is worthless</strong>; truth is a quorum decision, and outvoted nodes must step down.</li>
+    <li><strong>Design against an explicit system model</strong> (usually partially synchronous + crash-recovery); require safety always, liveness conditionally.</li>
+    <li><strong>If you can stay on a single machine, do</strong> — distribution is justified by fault tolerance and latency (data near users), not fashion; bounded-delay networks require utilization/cost most systems won't pay.</li>
+  </ol>
+</section>
+
+<!-- ═══ 18. CHECKPOINTS ═══ -->
+<section id="checkpoints">
+  <h2>18. Junior SWE Checkpoints</h2>
+
+  <div class="quiz">
+    <h4>Q1: Why can't you tell why a request got no response?</h4>
+    <p>Request lost, queued, server crashed, server paused (GC), response lost, or response delayed — all look identical (silence). Timeouts are a guess that conflates node failure with network trouble.</p>
+  </div>
+  <div class="quiz">
+    <h4>Q2: Time-of-day vs monotonic clock — when to use each?</h4>
+    <p>Time-of-day (wall clock): human timestamps, log correlation — but can jump backward (NTP). Monotonic (<code>nanoTime</code>): timeouts and durations — always forward, but meaningless across machines. Never use wall clock for elapsed time or cross-node ordering.</p>
+  </div>
+  <div class="quiz">
+    <h4>Q3: Why does LWW with timestamps silently lose data?</h4>
+    <p>Later writer's clock may lag earlier writer's. LWW picks higher timestamp, discarding the causally-later write — no error, no conflict surfaced. Fix: logical clocks (version vectors, Lamport timestamps).</p>
+  </div>
+  <div class="quiz">
+    <h4>Q4: Client checks lease valid, then writes. Why can this still corrupt data?</h4>
+    <p>GC pause (or VM suspend) between check and write. Lease expires; another client acquires and writes. First client wakes, check was stale. Fix: fencing tokens checked by the <em>storage service</em>, not the client.</p>
+  </div>
+  <div class="quiz">
+    <h4>Q5: Safety vs liveness — give an example of each.</h4>
+    <p>Safety ("nothing bad"): fencing token uniqueness — must never break, even if all nodes crash. Liveness ("eventually good"): availability, eventual consistency — conditional on majority up and network recovery.</p>
+  </div>
+  <div class="quiz">
+    <h4>Q6: Why do most datacenters assume crash-recovery, not Byzantine?</h4>
+    <p>You control all nodes; same software everywhere — compromise one, likely compromise all. BFT needs &gt;2/3 honest nodes and expensive protocols. Real defense: auth, access control, firewalls. Still guard weak lying with checksums and NTP outlier rejection.</p>
+  </div>
+  <div class="quiz">
+    <h4>Q7: How does this chapter connect to Ch 9 consensus?</h4>
+    <p>Ch 8 motivates the problem (partial failure, unreliable components) and the system model (partially sync + crash-recovery). Ch 9 delivers the algorithms — quorums, Raft/Paxos, leader election — that provide safety and liveness guarantees within that model. Fencing tokens underpin Ch 9's leader-election examples.</p>
+  </div>
+
+  <h3>Glossary</h3>
+  <table>
+    <tr><th>Term</th><th>Definition</th></tr>
+    <tr><td>Partial failure</td><td>Some components fail while others continue — non-deterministic, unlike single-machine crash</td></tr>
+    <tr><td>System model</td><td>Formal assumptions about timing and node failure types an algorithm relies on</td></tr>
+    <tr><td>Partially synchronous</td><td>Mostly bounded delays, occasionally shattered — realistic model for datacenters</td></tr>
+    <tr><td>Crash-recovery</td><td>Nodes crash and may return; stable storage survives, in-memory state lost</td></tr>
+    <tr><td>Safety property</td><td>"Nothing bad happens" — must hold always; violation is irreversible</td></tr>
+    <tr><td>Liveness property</td><td>"Something good eventually happens" — conditional on system health</td></tr>
+    <tr><td>Phi Accrual failure detector</td><td>Adaptive timeout based on RTT distribution (Akka, Cassandra)</td></tr>
+    <tr><td>Monotonic clock</td><td>Always moves forward — safe for timeouts/durations, not cross-node ordering</td></tr>
+    <tr><td>TrueTime</td><td>Spanner's clock API returning uncertainty interval [earliest, latest]</td></tr>
+    <tr><td>Logical clock</td><td>Counter tracking happens-before — safe for event ordering across nodes</td></tr>
+    <tr><td>Fencing token</td><td>Monotonically increasing number from lock service; storage rejects stale tokens</td></tr>
+    <tr><td>Byzantine fault</td><td>Node sends arbitrary/corrupted/malicious messages — needs &gt;2/3 honest majority</td></tr>
+    <tr><td>Limping node</td><td>Technically alive but effectively broken (e.g., NIC at 1 Kb/s) — worse than dead</td></tr>
+  </table>
+</section>
+
+<footer class="page-footer">
+  DDIA Visual Guide · Chapter 8 · Source: claude-skills/ch08-trouble-with-distributed-systems.md · Next: Ch 9 Consistency &amp; Consensus
+</footer>
+
+</body>
+</html>
