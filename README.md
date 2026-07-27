@@ -54,7 +54,7 @@ ddia-visual-guides/
 │   └── styles.css            ← shared print-friendly styling
 ├── scripts/
 │   └── export-pdf.js         ← HTML → PDF via Puppeteer
-└── output/                   ← generated PDFs (gitignored if you add .gitignore)
+└── output/                   ← generated PDFs (gitignored; run npm run export:all)
     ├── ch01-reliable-scalable-maintainable.pdf
     └── …
 ```
